@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -126,11 +127,12 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	for _, tdir := range dirs {
 		pageNumber := 0
 		numberOfEntities := maxEntitiesPerPage
+		isFound := false
 
 		for numberOfEntities == maxEntitiesPerPage {
 			oldPid := pid
 			pageNumber++
-			requestURL := makeSearchQuery(tdir, pid, f.opt.Token, pageNumber)
+			requestURL := makeSearchQuery("", pid, f.opt.Token, pageNumber)
 			responseResult := FileSearchRes{}
 			err := getUnmarshaledResponse(ctx, requestURL, &responseResult)
 			numberOfEntities = len(responseResult.SearchData.Entities)
@@ -145,6 +147,7 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 			for _, entity := range responseResult.SearchData.Entities {
 				if entity.Pid == pid && (entity.Type == "dir" || entity.Type == "sdir") && entity.Name == tdir {
 					pid = entity.ID
+					isFound = true
 				}
 			}
 
@@ -157,6 +160,10 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 				return 0, fmt.Errorf("too many results")
 			}
 
+		}
+
+		if !isFound {
+			return 0, fs.ErrorDirNotFound
 		}
 	}
 
@@ -309,7 +316,7 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 
 	for numberOfEntities == maxEntitiesPerPage {
 		pageNumber++
-		requestURL := makeSearchQuery(name, pid, token, pageNumber)
+		requestURL := makeSearchQuery("", pid, token, pageNumber)
 
 		searchResponse := FileSearchRes{}
 		err := getUnmarshaledResponse(ctx, requestURL, &searchResponse)
@@ -322,7 +329,7 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 		numberOfEntities = len(searchResponse.SearchData.Entities)
 
 		for _, entity := range searchResponse.SearchData.Entities {
-			if entity.Pid == pid {
+			if entity.Pid == pid && entity.Name == name {
 				newObject = entity
 				newObjectIsFound = true
 			}
@@ -375,6 +382,92 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		id:      newObject.ItemID,
 		pid:     newObject.Pid,
 	}, nil
+}
+
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(srcFs, "Can't move directory - not same remote type")
+		return fs.ErrorCantDirMove
+	}
+
+	dstFullPath := path.Join(f.root, dstRemote)
+	if dstFullPath == "" {
+		return nil
+	}
+	dstFullPath = strings.TrimPrefix(dstFullPath, "/")
+	_, err := getIdByDir(f, ctx, dstFullPath)
+	if err == nil {
+		return fs.ErrorDirExists
+	}
+
+	dstRemoteParentDir := filepath.Dir(dstRemote)
+	f.Mkdir(ctx, dstRemoteParentDir)
+	dstRemoteParentFullPath := path.Join(f.root, dstRemoteParentDir)
+	if dstRemoteParentFullPath == "" {
+		return nil
+	}
+	dstRemoteParentFullPath = strings.TrimPrefix(dstRemoteParentFullPath, "/")
+	pid, err := getIdByDir(f, ctx, dstRemoteParentFullPath)
+	if err != nil {
+		return err
+	}
+
+	srcFullPath := path.Join(f.root, srcRemote)
+	if srcFullPath == "" {
+		return nil
+	}
+	srcFullPath = strings.TrimPrefix(srcFullPath, "/")
+	dirIds, err := getIdByDir(f, ctx, srcFullPath)
+	if err != nil {
+		return err
+	}
+
+	var requestURL *url.URL
+	var q url.Values
+	if filepath.Dir(srcRemote) == filepath.Dir(dstRemote) {
+		//"https://www.linkbox.to/api/open/folder_edit"
+		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_edit")
+		q = requestURL.Query()
+		q.Set("dirId", strconv.Itoa(dirIds))
+		q.Set("name", filepath.Base(dstRemote))
+		q.Set("token", f.opt.Token)
+		q.Set("canShare", "1")
+		q.Set("canInvite", "1")
+		q.Set("change_avatar", "0")
+		q.Set("desc", "")
+	} else if filepath.Base(srcRemote) == filepath.Base(dstRemote) {
+		//"https://www.linkbox.to/api/open/folder_move"
+		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_move")
+		q = requestURL.Query()
+		q.Set("dirIds", strconv.Itoa(dirIds))
+		q.Set("pid", strconv.Itoa(pid))
+		q.Set("token", f.opt.Token)
+	} else {
+		return fs.ErrorCantDirMove
+	}
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return fmt.Errorf("err in response")
+	}
+
+	if response.Status != 1 {
+		return fmt.Errorf("could not move dir[%s] to dir[%s], %s", srcRemote, dstRemote, response.Message)
+	}
+
+	return nil
 }
 
 // Mkdir makes the directory (container, bucket)
@@ -496,9 +589,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fmt.Errorf("Open failed: %w", err)
 	}
 
-	// Add optional headers
-	for k, v := range fs.OpenOptionHeaders(options) {
-		req.Header.Add(k, v)
+	fs.FixRangeOption(options, o.size)
+	fs.OpenOptionAddHTTPHeaders(req.Header, options)
+	if o.size == 0 {
+		// Don't supply range requests for 0 length objects as they always fail
+		delete(req.Header, "Range")
 	}
 
 	res, err := fshttp.NewClient(ctx).Do(req)
@@ -585,7 +680,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	fullPath = strings.TrimPrefix(fullPath, "/")
 
 	pdir, name := splitDirAndName(fullPath)
+	pdirToCreateIfNotExists, _ := splitDirAndName(src.Remote())
+
 	pid, err := getIdByDir(o.fs, ctx, pdir)
+	if err == fs.ErrorDirNotFound && o.fs.Mkdir(ctx, pdirToCreateIfNotExists) == nil {
+		pid, err = getIdByDir(o.fs, ctx, pdir)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -765,53 +866,6 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 	err := o.Update(ctx, in, src, options...)
 	return o, err
-}
-
-// DirMove moves src, srcRemote to this remote at dstRemote
-// using server-side move operations.
-//
-// Will only be called if src.Fs().Name() == f.Name()
-//
-// If it isn't possible then return fs.ErrorCantDirMove
-//
-// If destination exists then return fs.ErrorDirExists
-func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	// https://www.linkbox.to/api/open/folder_move
-	// dirIds		string	Folder ids to move, multiple separated by commas
-	// pid	    	number	Destination folder id. 0 means move to the root directory.
-	// token		string	Your API token
-
-	requestURL, err := url.Parse("https://www.linkbox.to/api/open/folder_move")
-	if err != nil {
-		return fs.ErrorCantDirMove
-	}
-	q := requestURL.Query()
-
-	dirID, err := getIdByDir(f, ctx, srcRemote)
-	if err != nil {
-		return fs.ErrorCantDirMove
-	}
-
-	q.Set("dirIds", strconv.Itoa(dirID))
-	pid, err := getIdByDir(f, ctx, dstRemote)
-	if err != nil {
-		return fs.ErrorCantDirMove
-	}
-
-	q.Set("pid", strconv.Itoa(pid))
-	q.Set("token", f.opt.Token)
-	requestURL.RawQuery = q.Encode()
-	requstResult := getUploadUrlResponse{}
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &requstResult)
-	if err != nil {
-		return fs.ErrorCantDirMove
-	}
-
-	if requstResult.Status != 1 {
-		return fmt.Errorf("get unexpected message from Linkbox: %s", requstResult.Message)
-	}
-
-	return nil
 }
 
 // Check the interfaces are satisfied
