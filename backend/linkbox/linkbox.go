@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -78,7 +77,8 @@ type Object struct {
 	fullURL     string
 	pid         int
 	isDir       bool
-	id          string
+	id          int
+	itemId      string
 }
 
 // NewFs creates a new Fs object from the name and root. It connects to
@@ -161,6 +161,28 @@ type LoginRes struct {
 		} `json:"userInfo"`
 	} `json:"data"`
 	Status int `json:"status"`
+}
+
+func getIdByDirWithRetries(f *Fs, ctx context.Context, dir string) (pid int, err error) {
+    retry.Do(
+        func() error {
+            pid, err = getIdByDir(f, ctx, dir)
+            return err
+        },
+        retry.RetryIf(
+            func(error) bool {
+                log.Default().Printf("Error get dirId(%s): %s", dir, err)
+                return true
+            }),
+        retry.OnRetry(func(try uint, orig error) {
+            log.Default().Printf("Retrying to get dirId(%s). Attempt: %d", dir, try + 2)
+        }),
+        retry.Attempts(3),
+        retry.Delay(1*time.Second),
+        retry.MaxJitter(1*time.Second),
+    )
+
+    return
 }
 
 func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
@@ -246,7 +268,6 @@ func getUnmarshaledResponse(ctx context.Context, url string, result interface{})
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	//res, err := fshttp.NewClient(ctx).Do(req)
 	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return err
@@ -299,10 +320,17 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 		return nil, fmt.Errorf("Error login: %w", err)
 	}
 
+	total := response.Data.UserInfo.SizeCap
+	used := int64(response.Data.UserInfo.SizeCurr)
+	if used < 0 {
+		used = 0
+	}
+	free := total - used
+
 	usage = &fs.Usage{
-		Total: fs.NewUsageValue(response.Data.UserInfo.SizeCap),
-		Used:  fs.NewUsageValue(int64(response.Data.UserInfo.SizeCurr)),
-		Free: fs.NewUsageValue(response.Data.UserInfo.SizeCap - int64(response.Data.UserInfo.SizeCurr)),
+		Total: fs.NewUsageValue(total),
+		Used:  fs.NewUsageValue(used),
+		Free: fs.NewUsageValue(free),
 	}
 
 	return usage, nil
@@ -350,7 +378,8 @@ func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
 				size:        int64(entity.Size),
 				fullURL:     entity.URL,
 				isDir:       entity.Type == "dir" || entity.Type == "sdir",
-				id:          entity.ItemID,
+				id:          entity.ID,
+				itemId:      entity.ItemID,
 				pid:         entity.Pid,
 			}
 
@@ -410,6 +439,29 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	return entries, nil
 }
+
+func getObjectWithRetries(ctx context.Context, name string, pid int, token string) (entity Entity, err error) {
+    retry.Do(
+        func() error {
+            entity, err = getObject(ctx, name, pid, token)
+            return err
+        },
+        retry.RetryIf(
+            func(error) bool {
+                log.Default().Printf("Error get object(%s): %s", name, err)
+                return true
+            }),
+        retry.OnRetry(func(try uint, orig error) {
+            log.Default().Printf("Retrying to get object(%s). Attempt: %d", name, try + 2)
+        }),
+        retry.Attempts(3),
+        retry.Delay(3*time.Second),
+        retry.MaxJitter(1*time.Second),
+    )
+
+    return
+}
+
 func getObject(ctx context.Context, name string, pid int, token string) (Entity, error) {
 	var newObject Entity
 
@@ -435,6 +487,7 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 			if entity.Pid == pid && entity.Name == name {
 				newObject = entity
 				newObjectIsFound = true
+				break
 			}
 		}
 
@@ -446,6 +499,11 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 			return Entity{}, fmt.Errorf("too many results")
 		}
 	}
+
+	if !newObjectIsFound {
+		return Entity{}, fs.ErrorObjectNotFound
+	}
+
 	return newObject, nil
 }
 
@@ -478,12 +536,15 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	return &Object{
 		fs:      f,
-		remote:  name,
+		remote:  remote,
 		modTime: time.Unix(newObject.Ctime, 0),
 		fullURL: newObject.URL,
 		size:    int64(newObject.Size),
-		id:      newObject.ItemID,
+		isDir:   newObject.Type == "dir" || newObject.Type == "sdir",
+		itemId:  newObject.ItemID,
+		id: 	 newObject.ID,
 		pid:     newObject.Pid,
+		contentType: newObject.Type,
 	}, nil
 }
 
@@ -502,75 +563,20 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	dstFullPath := path.Join(f.root, dstRemote)
-	if dstFullPath == "" {
-		return nil
-	}
-	dstFullPath = strings.TrimPrefix(dstFullPath, "/")
-	_, err := getIdByDir(f, ctx, dstFullPath)
-	if err == nil {
-		return fs.ErrorDirExists
-	}
-
-	dstRemoteParentDir := filepath.Dir(dstRemote)
-	f.Mkdir(ctx, dstRemoteParentDir)
-	dstRemoteParentFullPath := path.Join(f.root, dstRemoteParentDir)
-	if dstRemoteParentFullPath == "" {
-		return nil
-	}
-	dstRemoteParentFullPath = strings.TrimPrefix(dstRemoteParentFullPath, "/")
-	pid, err := getIdByDir(f, ctx, dstRemoteParentFullPath)
+	fsObj, err := srcFs.NewObject(ctx, srcRemote)
 	if err != nil {
-		return err
-	}
-
-	srcFullPath := path.Join(f.root, srcRemote)
-	if srcFullPath == "" {
-		return nil
-	}
-	srcFullPath = strings.TrimPrefix(srcFullPath, "/")
-	dirIds, err := getIdByDir(f, ctx, srcFullPath)
-	if err != nil {
-		return err
-	}
-
-	var requestURL *url.URL
-	var q url.Values
-	if filepath.Dir(srcRemote) == filepath.Dir(dstRemote) {
-		//"https://www.linkbox.to/api/open/folder_edit"
-		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_edit")
-		q = requestURL.Query()
-		q.Set("dirId", strconv.Itoa(dirIds))
-		q.Set("name", filepath.Base(dstRemote))
-		q.Set("token", f.opt.Token)
-		q.Set("canShare", "1")
-		q.Set("canInvite", "1")
-		q.Set("change_avatar", "0")
-		q.Set("desc", "")
-	} else if filepath.Base(srcRemote) == filepath.Base(dstRemote) {
-		//"https://www.linkbox.to/api/open/folder_move"
-		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_move")
-		q = requestURL.Query()
-		q.Set("dirIds", strconv.Itoa(dirIds))
-		q.Set("pid", strconv.Itoa(pid))
-		q.Set("token", f.opt.Token)
-	} else {
 		return fs.ErrorCantDirMove
 	}
 
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
-
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
-	if err != nil {
-		return fmt.Errorf("err in response")
+	srcObj := fsObj.(*Object)
+	if !srcObj.isDir {
+		return fs.ErrorCantDirMove
 	}
 
-	if response.Status != 1 {
-		return fmt.Errorf("could not move dir[%s] to dir[%s], %s", srcRemote, dstRemote, response.Message)
-	}
+	srcObj.remote = srcRemote
+	_, err = f._MoveDir(ctx, srcObj, dstRemote)
 
-	return nil
+	return err
 }
 
 // Mkdir makes the directory (container, bucket)
@@ -594,6 +600,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		name = dirs[i+1]
 		pid, err := getIdByDir(f, ctx, pdir)
 		if err != nil {
+			log.Default().Printf("Error(%s) during making dir(%s)", err, dir)
 			return err
 		}
 
@@ -672,6 +679,230 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
+func (f *Fs) _ServerFolderEdit(ctx context.Context, dirId string, name string) error {
+	var requestURL *url.URL
+	var q url.Values
+
+	//"https://www.linkbox.to/api/open/folder_edit"
+	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_edit")
+	q = requestURL.Query()
+	q.Set("dirId", dirId)
+	q.Set("name", name)
+	q.Set("token", f.opt.Token)
+	q.Set("canShare", "1")
+	q.Set("canInvite", "1")
+	q.Set("change_avatar", "0")
+	q.Set("desc", "")
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return err
+	} else if response.Status != 1 {
+		return fmt.Errorf("Error folder_edit: %s", response.Message)
+	}
+
+	return nil
+}
+
+func (f *Fs) _ServerFolderMove(ctx context.Context, dirId string, pid string) error {
+	var requestURL *url.URL
+	var q url.Values
+
+	//"https://www.linkbox.to/api/open/folder_move"
+	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_move")
+	q = requestURL.Query()
+	q.Set("dirIds", dirId)
+	q.Set("pid", pid)
+	q.Set("token", f.opt.Token)
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return err
+	} else if response.Status != 1 {
+		return fmt.Errorf("Error folder_move: %s", response.Message)
+	}
+
+	return nil
+}
+
+func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) (fs.Object, error) {
+	srcFullPath := path.Join(srcObject.fs.root, srcObject.remote)
+	if srcFullPath == "" {
+		return nil, fs.ErrorCantDirMove
+	}
+	srcFullPath = strings.TrimPrefix(srcFullPath, "/")
+
+	dstFullPath := path.Join(f.root, dstRemote)
+	if dstFullPath == "" {
+		return nil, fs.ErrorCantDirMove
+	}
+	dstFullPath = strings.TrimPrefix(dstFullPath, "/")
+
+	_, err := getIdByDir(f, ctx, dstFullPath)
+	if err == nil {
+		return nil, fs.ErrorDirExists
+	}
+
+	if path.Dir(srcFullPath) == path.Dir(dstFullPath) {
+		err = f._ServerFolderEdit(ctx, strconv.Itoa(srcObject.id), path.Base(dstFullPath))
+		if err != nil {
+			return nil, fs.ErrorCantDirMove
+		}
+	} else if path.Base(srcFullPath) == path.Base(dstFullPath) {
+		pid, err := getIdByDir(f, ctx, path.Dir(dstFullPath))
+		if err == fs.ErrorDirNotFound && f.Mkdir(ctx, path.Dir(dstRemote)) == nil {
+			pid, err = getIdByDir(f, ctx, path.Dir(dstFullPath))
+		}
+		if err != nil {
+			return nil, fs.ErrorCantDirMove
+		}
+		err = f._ServerFolderMove(ctx, strconv.Itoa(srcObject.id), strconv.Itoa(pid))
+		if err != nil {
+			return nil, fs.ErrorCantDirMove
+		}
+	} else {
+		tmpSrcPath := path.Dir(srcFullPath) + "/" + path.Base(dstFullPath)
+		tmpDstPath := dstFullPath
+
+		srcPath := tmpSrcPath
+		dstPath := tmpDstPath
+		for i := 0; i <= 100; i++ {
+			if i > 0 {
+				srcPath =  tmpSrcPath + "__" + strconv.Itoa(i)
+				dstPath = tmpDstPath + "__" + strconv.Itoa(i)
+			}
+
+			// Ensure the temporary name doesn't exist in both src and dst
+			_, err = getIdByDir(f, ctx, srcPath)
+			if err == nil {
+				continue
+			}
+			_, err = getIdByDir(f, ctx, dstPath)
+			if err == nil {
+				continue
+			}
+
+			// Get dst pid
+			pid, err := getIdByDir(f, ctx, path.Dir(dstPath))
+			if err != nil {
+				return nil, fs.ErrorCantDirMove
+			}
+
+			// Rename src to temporary src
+			err = f._ServerFolderEdit(ctx, strconv.Itoa(srcObject.id), path.Base(srcPath))
+			if err != nil {
+				return nil, fs.ErrorCantDirMove
+			}
+
+			// Move temporary src to temmporary dst
+			err = f._ServerFolderMove(ctx, strconv.Itoa(srcObject.id), strconv.Itoa(pid))
+			if err != nil {
+				return nil, fs.ErrorCantDirMove
+			}
+
+			// Rename temporary dst to dst if necessary
+			if path.Base(dstPath) != path.Base(dstFullPath) {
+				err = f._ServerFolderEdit(ctx, strconv.Itoa(srcObject.id), path.Base(dstFullPath))
+				if err != nil {
+					return nil, fs.ErrorCantDirMove
+				}
+			}
+
+			break
+		}
+	}
+
+	newObject, err := f.NewObject(ctx, dstRemote)
+	if err != nil {
+		return nil, fs.ErrorCantDirMove
+	}
+
+	return newObject, nil
+}
+
+func (f *Fs) _MoveFile(ctx context.Context, srcObject *Object, remote string) (fs.Object, error) {
+	srcFullPath := path.Join(srcObject.fs.root, srcObject.remote)
+	srcFullPath = strings.TrimPrefix(srcFullPath, "/")
+
+	dstFullPath := path.Join(f.root, remote)
+	dstFullPath = strings.TrimPrefix(dstFullPath, "/")
+
+	var requestURL *url.URL
+	var q url.Values
+	if path.Dir(srcFullPath) == path.Dir(dstFullPath) {
+		//"https://www.linkbox.to/api/open/file_rename"
+		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_rename")
+		q = requestURL.Query()
+		q.Set("itemId", srcObject.itemId)
+		q.Set("name", path.Base(dstFullPath))
+		q.Set("token", f.opt.Token)
+	} else if path.Base(srcFullPath) == path.Base(dstFullPath) {
+		dirId, err := getIdByDir(f, ctx, path.Dir(dstFullPath))
+		if err != nil {
+			return nil, fs.ErrorCantMove
+		}
+
+		//"https://www.linkbox.to/api/open/file_move"
+		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_move")
+		q = requestURL.Query()
+		q.Set("itemIds", srcObject.itemId)
+		q.Set("pid", strconv.Itoa(dirId))
+		q.Set("token", f.opt.Token)
+	} else {
+		// TODO: move & rename
+		return nil, fs.ErrorCantMove
+	}
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return nil, fs.ErrorCantMove
+	}
+
+	if response.Status != 1 && response.Status != 1501 {
+		log.Default().Printf("could not move file[%s] to file[%s], status: %d, msg: %s",
+			srcObject.remote, remote, response.Status, response.Message)
+	}
+
+	newObject, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, fs.ErrorCantMove
+	}
+
+	return newObject, nil
+}
+
+// Move src to this remote using server-side move operations.
+//
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't move - not same remote type")
+		return nil, fs.ErrorCantMove
+	}
+
+	if !srcObj.isDir {
+		return f._MoveFile(ctx, srcObj, remote)
+	} else {
+		return f._MoveDir(ctx, srcObj, remote)
+	}
+}
+
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	downloadURL := o.fullURL
@@ -699,7 +930,6 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		delete(req.Header, "Range")
 	}
 
-	//res, err := fshttp.NewClient(ctx).Do(req)
 	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return nil, fmt.Errorf("Open failed: %w", err)
@@ -757,7 +987,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			return err
 		}
 
-		//res, err := fshttp.NewClient(ctx).Do(req)
 		res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 		if err != nil {
 			return err
@@ -788,7 +1017,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	pid, err := getIdByDir(o.fs, ctx, pdir)
 	if err == fs.ErrorDirNotFound && o.fs.Mkdir(ctx, pdirToCreateIfNotExists) == nil {
-		pid, err = getIdByDir(o.fs, ctx, pdir)
+		pid, err = getIdByDirWithRetries(o.fs, ctx, pdir)
 	}
 
 	if err != nil {
@@ -803,24 +1032,33 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	q.Set("token", o.fs.opt.Token)
 
 	requestURL.RawQuery = q.Encode()
-	getSecondStepResult := getUploadUrlResponse{}
+	getSecondStepResult := getUploadFileResponse{}
 	err = getUnmarshaledResponse(ctx, requestURL.String(), &getSecondStepResult)
 	if err != nil {
 		return err
 	}
 	if getSecondStepResult.Status != 1 {
-		return fmt.Errorf("get bad status from linkbox: %s", getSecondStepResult.Message)
+		return fmt.Errorf("get bad status from linkbox: %s", getSecondStepResult.Msg)
 	}
 
-	newObject, err := getObject(ctx, name, pid, o.fs.opt.Token)
-	if err != nil {
-		return err
-	}
-	if newObject == (Entity{}) {
-		return fs.ErrorObjectNotFound
+	newObject, err := getObjectWithRetries(ctx, name, pid, o.fs.opt.Token)
+	if err != nil || newObject == (Entity{}) {
+		log.Default().Printf(
+			"getObjectWithRetries(%s) failed, fallback to directly update object from response",
+			name)
+		o.pid = pid
+		o.itemId = getSecondStepResult.Data.ItemID
+		o.remote = src.Remote()
+		o.size = src.Size()
+		return nil
 	}
 
 	o.pid = pid
+	o.fullURL = newObject.URL
+	o.id = newObject.ID
+	o.itemId = newObject.ItemID
+	o.isDir = newObject.Type == "dir" || newObject.Type == "sdir"
+	o.contentType = newObject.Type
 	o.remote = src.Remote()
 	o.modTime = time.Unix(newObject.Ctime, 0)
 	o.size = src.Size()
@@ -837,7 +1075,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		log.Fatal(err)
 	}
 	q := requestURL.Query()
-	q.Set("itemIds", o.id)
+	q.Set("itemIds", o.itemId)
 	q.Set("token", o.fs.opt.Token)
 	requestURL.RawQuery = q.Encode()
 	requstResult := getUploadUrlResponse{}
@@ -953,6 +1191,14 @@ type getUploadUrlResponse struct {
 	getResponse
 }
 
+type getUploadFileResponse struct {
+	Data struct {
+		ItemID string `json:"itemId"`
+	} `json:"data"`
+	Msg    string `json:"msg"`
+	Status int    `json:"status"`
+}
+
 // Put in to the remote path with the modTime given of the given size
 //
 // When called from outside an Fs by rclone, src.Size() will always be >= 0.
@@ -976,6 +1222,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 var (
 	_ fs.Fs        = &Fs{}
 	_ fs.DirMover  = &Fs{}
+	_ fs.Mover     = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.MimeTyper = &Object{}
 )
