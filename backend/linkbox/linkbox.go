@@ -18,11 +18,13 @@ import (
 
 	"github.com/avast/retry-go"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/encoder"
 )
 
 var (
@@ -46,6 +48,11 @@ func init() {
 			Name:       "password",
 			Help:       "The password for https://www.linkbox.to/api/user/login_email?pwd={password}",
 			IsPassword: true,
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			Default: encoder.EncodeInvalidUtf8,
 		}},
 	}
 	fs.Register(fsi)
@@ -53,9 +60,10 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Token string `config:"token"`
-	Email string `config:"email"`
-	Password string `config:"password"`
+	Token string             `config:"token"`
+	Email string             `config:"email"`
+	Password string          `config:"password"`
+	Enc encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -228,7 +236,9 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 			}
 
 			for _, entity := range responseResult.SearchData.Entities {
-				if entity.Pid == pid && (entity.Type == "dir" || entity.Type == "sdir") && entity.Name == tdir {
+				if entity.Pid == pid &&
+					(entity.Type == "dir" || entity.Type == "sdir") &&
+					f.opt.Enc.ToStandardName(entity.Name) == tdir {
 					pid = entity.ID
 					isFound = true
 				}
@@ -385,7 +395,7 @@ func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
 		for _, entity := range responseResult.SearchData.Entities {
 			file := &Object{
 				fs:          f,
-				remote:      entity.Name,
+				remote:      f.opt.Enc.ToStandardName(entity.Name),
 				modTime:     time.Unix(entity.Ctime, 0),
 				contentType: entity.Type,
 				subType:     entity.SubType,
@@ -454,10 +464,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-func getObjectWithRetries(ctx context.Context, name string, pid int, token string) (entity Entity, err error) {
+func getObjectWithRetries(f* Fs, ctx context.Context, name string, pid int, token string) (entity Entity, err error) {
     retry.Do(
         func() error {
-            entity, err = getObject(ctx, name, pid, token)
+            entity, err = getObject(f, ctx, name, pid, token)
             return err
         },
         retry.RetryIf(
@@ -476,7 +486,7 @@ func getObjectWithRetries(ctx context.Context, name string, pid int, token strin
     return
 }
 
-func getObject(ctx context.Context, name string, pid int, token string) (Entity, error) {
+func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (Entity, error) {
 	var newObject Entity
 
 	pageNumber := 0
@@ -498,7 +508,7 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 		numberOfEntities = len(searchResponse.SearchData.Entities)
 
 		for _, entity := range searchResponse.SearchData.Entities {
-			if entity.Pid == pid && entity.Name == name {
+			if entity.Pid == pid && f.opt.Enc.ToStandardName(entity.Name) == name {
 				newObject = entity
 				newObjectIsFound = true
 				break
@@ -543,7 +553,7 @@ func (f *Fs) _NewObject(ctx context.Context, remote string, allowDir bool) (fs.O
 		return nil, fs.ErrorObjectNotFound
 	}
 
-	newObject, err = getObject(ctx, name, dirId, f.opt.Token)
+	newObject, err = getObject(f, ctx, name, dirId, f.opt.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -630,7 +640,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		//"https://www.linkbox.to/api/open/folder_create"
 		requestURL, _ := url.Parse("https://www.linkbox.to/api/open/folder_create")
 		q := requestURL.Query()
-		q.Set("name", name)
+		q.Set("name", f.opt.Enc.FromStandardName(name))
 		q.Set("pid", strconv.Itoa(pid))
 		q.Set("token", f.opt.Token)
 		q.Set("isShare", "0")
@@ -660,12 +670,11 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	return nil
 }
 
-// Rmdir removes the directory (container, bucket) if empty
-//
-// Return an error if it doesn't exist or isn't empty
-func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+// purgeCheck removes the root directory, if check is set then it
+// refuses to do so if it has anything in
+func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	objects, _ := parse(f, ctx, dir)
-	if len(objects) != 0 {
+	if check && len(objects) != 0 {
 		return fs.ErrorDirectoryNotEmpty
 	}
 
@@ -682,7 +691,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return err
 	}
 
-	//"https://www.linkbox.to/api/open/folder_create"
+	//"https://www.linkbox.to/api/open/folder_del"
 	requestURL, _ := url.Parse("https://www.linkbox.to/api/open/folder_del")
 	q := requestURL.Query()
 	q.Set("dirIds", strconv.Itoa(dirIds))
@@ -703,6 +712,22 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return nil
 }
 
+// Rmdir removes the directory (container, bucket) if empty
+//
+// Return an error if it doesn't exist or isn't empty
+func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, true)
+}
+
+// Purge deletes all the files and the container
+//
+// Optional interface: Only implement this if you have a way of
+// deleting all the files quicker than just running Remove() on the
+// result of List()
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
+}
+
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return fs.ErrorCantSetModTime
 }
@@ -715,7 +740,7 @@ func (f *Fs) _ServerFolderEdit(ctx context.Context, dirId string, name string) e
 	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_edit")
 	q = requestURL.Query()
 	q.Set("dirId", dirId)
-	q.Set("name", name)
+	q.Set("name", f.opt.Enc.FromStandardName(name))
 	q.Set("token", f.opt.Token)
 	q.Set("canShare", "1")
 	q.Set("canInvite", "1")
@@ -797,16 +822,13 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 	} else {
 		tmpSrcPath := path.Dir(srcFullPath) + "/" + path.Base(dstFullPath)
 		tmpDstPath := dstFullPath
-		tmpDstParentDirPath := path.Dir(dstRemote)
 
 		srcPath := tmpSrcPath
 		dstPath := tmpDstPath
-		dstParentDirPath := tmpDstParentDirPath
 		for i := 0; i <= 100; i++ {
 			if i > 0 {
 				srcPath =  tmpSrcPath + "__" + strconv.Itoa(i)
 				dstPath = tmpDstPath + "__" + strconv.Itoa(i)
-				dstParentDirPath = tmpDstParentDirPath + "__" + strconv.Itoa(i)
 			}
 
 			// Ensure the temporary name doesn't exist in both src and dst
@@ -821,7 +843,7 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 
 			// Get dst pid
 			pid, err := getIdByDir(f, ctx, path.Dir(dstPath))
-			if err == fs.ErrorDirNotFound && f.Mkdir(ctx, dstParentDirPath) == nil {
+			if err == fs.ErrorDirNotFound && f.Mkdir(ctx, path.Dir(dstRemote)) == nil {
 				pid, err = getIdByDirWithRetries(f, ctx, path.Dir(dstPath))
 			}
 
@@ -830,7 +852,7 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 			}
 
 			// Rename src to temporary src
-			err = f._ServerFolderEdit(ctx, strconv.Itoa(srcObject.id), path.Base(srcPath))
+			err = srcObject.fs._ServerFolderEdit(ctx, strconv.Itoa(srcObject.id), path.Base(srcPath))
 			if err != nil {
 				return nil, fs.ErrorCantDirMove
 			}
@@ -868,43 +890,78 @@ func (f *Fs) _MoveFile(ctx context.Context, srcObject *Object, remote string) (f
 	dstFullPath := path.Join(f.root, remote)
 	dstFullPath = strings.TrimPrefix(dstFullPath, "/")
 
-	var requestURL *url.URL
-	var q url.Values
 	if path.Dir(srcFullPath) == path.Dir(dstFullPath) {
-		//"https://www.linkbox.to/api/open/file_rename"
-		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_rename")
-		q = requestURL.Query()
-		q.Set("itemId", srcObject.itemId)
-		q.Set("name", path.Base(dstFullPath))
-		q.Set("token", f.opt.Token)
+		err := f._ServerFileRename(ctx, srcObject.itemId, f.opt.Enc.FromStandardName(path.Base(dstFullPath)))
+		if err != nil {
+			return nil, fs.ErrorCantMove
+		}
 	} else if path.Base(srcFullPath) == path.Base(dstFullPath) {
 		dirId, err := getIdByDir(f, ctx, path.Dir(dstFullPath))
 		if err != nil {
 			return nil, fs.ErrorCantMove
 		}
-
-		//"https://www.linkbox.to/api/open/file_move"
-		requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_move")
-		q = requestURL.Query()
-		q.Set("itemIds", srcObject.itemId)
-		q.Set("pid", strconv.Itoa(dirId))
-		q.Set("token", f.opt.Token)
+		err = f._ServerFileMove(ctx, srcObject.itemId, strconv.Itoa(dirId))
+		if err != nil {
+			return nil, fs.ErrorCantMove
+		}
 	} else {
-		// TODO: move & rename
-		return nil, fs.ErrorCantMove
-	}
+		tmpSrcRemote := path.Dir(srcObject.Remote()) + "/" + path.Base(remote)
+		tmpDstRemote := remote
+		tmpDstPath := dstFullPath
 
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
+		srcRemote := tmpSrcRemote
+		dstRemote := tmpDstRemote
+		dstPath := tmpDstPath
+		for i := 0; i <= 100; i++ {
+			if i > 0 {
+				srcRemote =  tmpSrcRemote + "__" + strconv.Itoa(i)
+				dstRemote = tmpDstRemote + "__" + strconv.Itoa(i)
+				dstPath = tmpDstPath + "__" + strconv.Itoa(i)
+			}
 
-	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
-	if err != nil {
-		return nil, fs.ErrorCantMove
-	}
+			// Ensure the temporary name doesn't exist in both src and dst
+			_, err := srcObject.fs.NewObject(ctx, srcRemote)
+			if err == nil {
+				continue
+			}
+			_, err = f.NewObject(ctx, dstRemote)
+			if err == nil {
+				continue
+			}
 
-	if response.Status != 1 && response.Status != 1501 {
-		log.Default().Printf("could not move file[%s] to file[%s], status: %d, msg: %s",
-			srcObject.remote, remote, response.Status, response.Message)
+			// Get dst pid
+			pid, err := getIdByDir(f, ctx, path.Dir(dstPath))
+			if err == fs.ErrorDirNotFound && f.Mkdir(ctx, path.Dir(dstRemote)) == nil {
+				pid, err = getIdByDirWithRetries(f, ctx, path.Dir(dstPath))
+			}
+
+			if err != nil {
+				return nil, fs.ErrorCantMove
+			}
+
+			// Rename src to temporary src
+			err = srcObject.fs._ServerFileRename(
+				ctx, srcObject.itemId, f.opt.Enc.FromStandardName(path.Base(srcRemote)))
+			if err != nil {
+				return nil, fs.ErrorCantMove
+			}
+
+			// Move temporary src to temmporary dst
+			err = f._ServerFileMove(ctx, srcObject.itemId, strconv.Itoa(pid))
+			if err != nil {
+				return nil, fs.ErrorCantMove
+			}
+
+			// Rename temporary dst to dst if necessary
+			if path.Base(dstPath) != path.Base(dstFullPath) {
+				err = f._ServerFileRename(ctx, srcObject.itemId, f.opt.Enc.FromStandardName(path.Base(dstFullPath)))
+				if err != nil {
+					return nil, fs.ErrorCantMove
+				}
+			}
+
+			break
+		}
 	}
 
 	newObject, err := f.NewObject(ctx, remote)
@@ -913,6 +970,54 @@ func (f *Fs) _MoveFile(ctx context.Context, srcObject *Object, remote string) (f
 	}
 
 	return newObject, nil
+}
+
+func (f *Fs) _ServerFileRename(ctx context.Context, itemId string, name string) error {
+	var requestURL *url.URL
+	var q url.Values
+
+	//"https://www.linkbox.to/api/open/file_rename"
+	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_rename")
+	q = requestURL.Query()
+	q.Set("itemId", itemId)
+	q.Set("name", name)
+	q.Set("token", f.opt.Token)
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return err
+	} else if response.Status != 1 && response.Status != 1501 {
+		return fmt.Errorf("Error file_rename: %s", response.Message)
+	}
+
+	return nil
+}
+
+func (f *Fs) _ServerFileMove(ctx context.Context, itemId string, pid string) error {
+	var requestURL *url.URL
+	var q url.Values
+
+	//"https://www.linkbox.to/api/open/file_move"
+	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_move")
+	q = requestURL.Query()
+	q.Set("itemIds", itemId)
+	q.Set("pid", pid)
+	q.Set("token", f.opt.Token)
+
+	requestURL.RawQuery = q.Encode()
+	response := getResponse{}
+
+	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil {
+		return err
+	} else if response.Status != 1 && response.Status != 1501 {
+		return fmt.Errorf("Error file_move: %s", response.Message)
+	}
+
+	return nil
 }
 
 // Move src to this remote using server-side move operations.
@@ -931,11 +1036,11 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantMove
 	}
 
-	if !srcObj.isDir {
-		return f._MoveFile(ctx, srcObj, remote)
-	} else {
-		return f._MoveDir(ctx, srcObj, remote)
+	if srcObj.isDir {
+		return nil, fs.ErrorCantMove
 	}
+
+	return f._MoveFile(ctx, srcObj, remote)
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
@@ -943,7 +1048,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	downloadURL := o.fullURL
 	if downloadURL == "" {
 		_, name := splitDirAndName(o.Remote())
-		newObject, err := getObject(ctx, name, o.pid, o.fs.opt.Token)
+		newObject, err := getObject(o.fs, ctx, name, o.pid, o.fs.opt.Token)
 		if err != nil {
 			return nil, err
 		}
@@ -1063,7 +1168,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	q.Set("fileMd5ofPre10m", fmt.Sprintf("%x", h.Sum(nil)))
 	q.Set("fileSize", strconv.FormatInt(src.Size(), 10))
 	q.Set("pid", strconv.Itoa(pid))
-	q.Set("diyName", name)
+	q.Set("diyName", o.fs.opt.Enc.FromStandardName(name))
 	q.Set("token", o.fs.opt.Token)
 
 	requestURL.RawQuery = q.Encode()
@@ -1076,17 +1181,21 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return fmt.Errorf("get bad status from linkbox: %s", getSecondStepResult.Msg)
 	}
 
-	newObject, err := getObjectWithRetries(ctx, name, pid, o.fs.opt.Token)
+	newObject, err := getObjectWithRetries(o.fs, ctx, name, pid, o.fs.opt.Token)
 	if err != nil || newObject == (Entity{}) {
+		if getSecondStepResult.Data.ItemID != "" {
+			log.Default().Printf(
+				"Fallback to directly update object from response as getObjectWithRetries(%s) failed",
+				name)
+			o.pid = pid
+			o.itemId = getSecondStepResult.Data.ItemID
+			o.remote = o.Remote()
+			o.size = src.Size()
+			o.modTime = time.Now()
+			return nil
+		}
 		log.Default().Printf(
-			"getObjectWithRetries(%s) failed, fallback to directly update object from response",
-			name)
-		o.pid = pid
-		o.itemId = getSecondStepResult.Data.ItemID
-		o.remote = o.Remote()
-		o.size = src.Size()
-		o.modTime = time.Now()
-		return nil
+			"Failed both getObjectWithRetries(%s) and direct object update", name)
 	}
 
 	o.pid = pid
@@ -1124,6 +1233,27 @@ func (o *Object) Remove(ctx context.Context) error {
 	if requstResult.Status != 1 {
 		return fmt.Errorf("get unexpected message from Linkbox: %s", requstResult.Message)
 	}
+
+	// Deflake rmdir-right-after-remove
+	retry.Do(
+        func() error {
+            _, err = o.fs.NewObject(ctx, o.Remote())
+            if (err == fs.ErrorObjectNotFound) {
+				return nil
+			}
+			return fmt.Errorf("server hasn't reflected file(%s) removal", o.Remote())
+        },
+        retry.RetryIf(
+            func(error) bool {
+                return true
+            }),
+        retry.OnRetry(func(try uint, orig error) {
+            log.Default().Printf("%s. Attempt: %d", orig, try + 2)
+        }),
+        retry.Attempts(3),
+        retry.Delay(3*time.Second),
+        retry.MaxJitter(1*time.Second),
+    )
 
 	return nil
 }
@@ -1271,6 +1401,8 @@ var (
 	_ fs.Fs        = &Fs{}
 	_ fs.DirMover  = &Fs{}
 	_ fs.Mover     = &Fs{}
+	_ fs.Purger    = &Fs{}
+	_ fs.Abouter   = &Fs{}
 	_ fs.Object    = &Object{}
 	_ fs.MimeTyper = &Object{}
 )
