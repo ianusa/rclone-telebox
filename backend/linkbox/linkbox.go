@@ -74,6 +74,7 @@ type Object struct {
 	size        int64
 	modTime     time.Time
 	contentType string
+	subType     string
 	fullURL     string
 	pid         int
 	isDir       bool
@@ -103,20 +104,32 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 		WriteMetadata:           false,
+		ReadMimeType:            true,
+		WriteMimeType:           false,
 	}).Fill(ctx, f)
+
+	rootFsObj, err := f._NewObject(ctx, "", true)
+	if err == nil {
+		rootObj := rootFsObj.(*Object)
+		if !rootObj.isDir {
+			f.root = path.Dir(f.root)
+			return f, fs.ErrorIsFile
+		}
+	}
 
 	return f, nil
 }
 
 type Entity struct {
-	Type   string `json:"type"`
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	Ctime  int64  `json:"ctime"`
-	Size   int    `json:"size"`
-	ID     int    `json:"id"`
-	Pid    int    `json:"pid"`
-	ItemID string `json:"item_id"`
+	Type    string `json:"type"`
+	SubType string `json:"sub_type"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Ctime   int64  `json:"ctime"`
+	Size    int    `json:"size"`
+	ID      int    `json:"id"`
+	Pid     int    `json:"pid"`
+	ItemID  string `json:"item_id"`
 }
 type Data struct {
 	Entities []Entity `json:"list"`
@@ -186,7 +199,7 @@ func getIdByDirWithRetries(f *Fs, ctx context.Context, dir string) (pid int, err
 }
 
 func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
-	if dir == "" || dir == "/" {
+	if dir == "" || dir == "/" || dir =="." {
 		return 0, nil // we assume that it is root directory
 	}
 
@@ -375,6 +388,7 @@ func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
 				remote:      entity.Name,
 				modTime:     time.Unix(entity.Ctime, 0),
 				contentType: entity.Type,
+				subType:     entity.SubType,
 				size:        int64(entity.Size),
 				fullURL:     entity.URL,
 				isDir:       entity.Type == "dir" || entity.Type == "sdir",
@@ -514,6 +528,10 @@ func getObject(ctx context.Context, name string, pid int, token string) (Entity,
 // ErrorIsDir if possible without doing any extra work,
 // otherwise ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return f._NewObject(ctx, remote, false)
+}
+
+func (f *Fs) _NewObject(ctx context.Context, remote string, allowDir bool) (fs.Object, error) {
 	var newObject Entity
 	var dir, name string
 
@@ -534,17 +552,22 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		return nil, fs.ErrorObjectNotFound
 	}
 
+	if !allowDir && (newObject.Type == "dir" || newObject.Type == "sdir") {
+		return nil, fs.ErrorIsDir
+	}
+
 	return &Object{
-		fs:      f,
-		remote:  remote,
-		modTime: time.Unix(newObject.Ctime, 0),
-		fullURL: newObject.URL,
-		size:    int64(newObject.Size),
-		isDir:   newObject.Type == "dir" || newObject.Type == "sdir",
-		itemId:  newObject.ItemID,
-		id: 	 newObject.ID,
-		pid:     newObject.Pid,
+		fs:          f,
+		remote:      remote,
+		modTime:     time.Unix(newObject.Ctime, 0),
+		fullURL:     newObject.URL,
+		size:        int64(newObject.Size),
+		isDir:       newObject.Type == "dir" || newObject.Type == "sdir",
+		itemId:      newObject.ItemID,
+		id: 	     newObject.ID,
+		pid:         newObject.Pid,
 		contentType: newObject.Type,
+		subType:     newObject.SubType,
 	}, nil
 }
 
@@ -563,7 +586,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	fsObj, err := srcFs.NewObject(ctx, srcRemote)
+	fsObj, err := srcFs._NewObject(ctx, srcRemote, true)
 	if err != nil {
 		return fs.ErrorCantDirMove
 	}
@@ -598,9 +621,9 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	for i, dirName := range dirs {
 		pdir = path.Join(pdir, dirName)
 		name = dirs[i+1]
-		pid, err := getIdByDir(f, ctx, pdir)
+		pid, err := getIdByDirWithRetries(f, ctx, pdir)
 		if err != nil {
-			log.Default().Printf("Error(%s) during making dir(%s)", err, dir)
+			log.Default().Printf("Error(%s) during making dir(%s)", err, dirName)
 			return err
 		}
 
@@ -641,6 +664,11 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	objects, _ := parse(f, ctx, dir)
+	if len(objects) != 0 {
+		return fs.ErrorDirectoryNotEmpty
+	}
+
 	fullPath := path.Join(f.root, dir)
 
 	if fullPath == "" {
@@ -769,17 +797,20 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 	} else {
 		tmpSrcPath := path.Dir(srcFullPath) + "/" + path.Base(dstFullPath)
 		tmpDstPath := dstFullPath
+		tmpDstParentDirPath := path.Dir(dstRemote)
 
 		srcPath := tmpSrcPath
 		dstPath := tmpDstPath
+		dstParentDirPath := tmpDstParentDirPath
 		for i := 0; i <= 100; i++ {
 			if i > 0 {
 				srcPath =  tmpSrcPath + "__" + strconv.Itoa(i)
 				dstPath = tmpDstPath + "__" + strconv.Itoa(i)
+				dstParentDirPath = tmpDstParentDirPath + "__" + strconv.Itoa(i)
 			}
 
 			// Ensure the temporary name doesn't exist in both src and dst
-			_, err = getIdByDir(f, ctx, srcPath)
+			_, err = getIdByDir(srcObject.fs, ctx, srcPath)
 			if err == nil {
 				continue
 			}
@@ -790,6 +821,10 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 
 			// Get dst pid
 			pid, err := getIdByDir(f, ctx, path.Dir(dstPath))
+			if err == fs.ErrorDirNotFound && f.Mkdir(ctx, dstParentDirPath) == nil {
+				pid, err = getIdByDirWithRetries(f, ctx, path.Dir(dstPath))
+			}
+
 			if err != nil {
 				return nil, fs.ErrorCantDirMove
 			}
@@ -818,7 +853,7 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 		}
 	}
 
-	newObject, err := f.NewObject(ctx, dstRemote)
+	newObject, err := f._NewObject(ctx, dstRemote, true)
 	if err != nil {
 		return nil, fs.ErrorCantDirMove
 	}
@@ -1009,11 +1044,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	fullPath := path.Join(o.fs.root, src.Remote())
+	fullPath := path.Join(o.fs.root, o.Remote())
 	fullPath = strings.TrimPrefix(fullPath, "/")
 
 	pdir, name := splitDirAndName(fullPath)
-	pdirToCreateIfNotExists, _ := splitDirAndName(src.Remote())
+	pdirToCreateIfNotExists, _ := splitDirAndName(o.Remote())
 
 	pid, err := getIdByDir(o.fs, ctx, pdir)
 	if err == fs.ErrorDirNotFound && o.fs.Mkdir(ctx, pdirToCreateIfNotExists) == nil {
@@ -1048,8 +1083,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			name)
 		o.pid = pid
 		o.itemId = getSecondStepResult.Data.ItemID
-		o.remote = src.Remote()
+		o.remote = o.Remote()
 		o.size = src.Size()
+		o.modTime = time.Now()
 		return nil
 	}
 
@@ -1059,7 +1095,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	o.itemId = newObject.ItemID
 	o.isDir = newObject.Type == "dir" || newObject.Type == "sdir"
 	o.contentType = newObject.Type
-	o.remote = src.Remote()
+	o.subType = newObject.SubType
+	o.remote = o.Remote()
 	o.modTime = time.Unix(newObject.Ctime, 0)
 	o.size = src.Size()
 
@@ -1126,7 +1163,18 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
 
 // MimeType of an Object if known, "" otherwise
 func (o *Object) MimeType(ctx context.Context) string {
-	return o.contentType
+	if o.contentType != "" && o.subType != "" {
+		t := o.contentType
+		if t == "doc" {
+			t = "text"
+		}
+		st := o.subType
+		if st == "txt" {
+			st = "plain"
+		}
+		return t + "/" + st
+	}
+	return ""
 }
 
 // Storable returns whether the remote http file is a regular file
