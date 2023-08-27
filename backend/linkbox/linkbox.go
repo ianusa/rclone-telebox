@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rclone/rclone/backend/linkbox/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -34,7 +35,7 @@ var (
 
 const (
 	maxEntitiesPerPage = 64
-	minSleep           = 20 * time.Millisecond
+	minSleep           = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep           = 4 * time.Second
 	decayConstant      = 2
 )
@@ -143,69 +144,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-type Entity struct {
-	Type    string `json:"type"`
-	SubType string `json:"sub_type"`
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Ctime   int64  `json:"ctime"`
-	Size    int    `json:"size"`
-	ID      int    `json:"id"`
-	Pid     int    `json:"pid"`
-	ItemID  string `json:"item_id"`
-}
-type Data struct {
-	Entities []Entity `json:"list"`
-}
-type FileSearchRes struct {
-	SearchData Data   `json:"data"`
-	Status     int    `json:"status"`
-	Message    string `json:"msg"`
-}
-
-type LoginRes struct {
-	Data struct {
-		Avatar       string `json:"avatar"`
-		Nickname     string `json:"nickname"`
-		OpenID       string `json:"openId"`
-		RefreshToken string `json:"refresh_token"`
-		Token        string `json:"token"`
-		UID          int    `json:"uid"`
-		UserInfo     struct {
-			APIKey         string `json:"api_key"`
-			AutoRenew      bool   `json:"auto_renew"`
-			Avatar         string `json:"avatar"`
-			BuyP7          bool   `json:"buy_p7"`
-			Email          string `json:"email"`
-			FavFlag        bool   `json:"fav_flag"`
-			GroupPLimitCnt int    `json:"group_p_limit_cnt"`
-			IsTry          bool   `json:"is_try"`
-			Nickname       string `json:"nickname"`
-			OpenID         string `json:"open_id"`
-			SetPrivacy     int    `json:"set_privacy"`
-			SizeCap        int64  `json:"size_cap"`
-			SizeCurr       int    `json:"size_curr"`
-			State          int    `json:"state"`
-			SubAutoRenew   int    `json:"sub_auto_renew"`
-			SubOrderID     int    `json:"sub_order_id"`
-			SubPid         int    `json:"sub_pid"`
-			SubSource      int    `json:"sub_source"`
-			SubType        int    `json:"sub_type"`
-			UID            int    `json:"uid"`
-			VipEnd         int    `json:"vip_end"`
-			VipLv          int    `json:"vip_lv"`
-		} `json:"userInfo"`
-	} `json:"data"`
-	Status int `json:"status"`
-}
-
 func getIdByDirWithRetries(f *Fs, ctx context.Context, dir string) (pid int, err error) {
 	f.pacer.Call(func() (bool, error) {
 		pid, err = getIdByDir(f, ctx, dir)
-		if err != nil {
-			log.Default().Printf("Retrying get dirId(%s), err: %s", dir, err)
-		}
-		return err != nil, err
+		return err != nil, fmt.Errorf("failed to get dirId(%s), err: %w", dir, err)
 	})
 
     return
@@ -228,9 +170,9 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 		for numberOfEntities == maxEntitiesPerPage {
 			oldPid := pid
 			pageNumber++
-			requestURL := makeSearchQuery("", pid, f.opt.Token, pageNumber)
-			responseResult := FileSearchRes{}
-			err := f._GetUnmarshaledResponse(ctx, requestURL, &responseResult)
+			request := makeSearchQuery("", pid, f.opt.Token, pageNumber)
+			responseResult := api.FileSearchRes{}
+			err := f._GetUnmarshaledResponse(ctx, request, &responseResult)
 			numberOfEntities = len(responseResult.SearchData.Entities)
 
 			if err != nil {
@@ -268,37 +210,17 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	return pid, nil
 }
 
-func (f *Fs) _FetchDataWithRetries(client *http.Client, req *http.Request) (resp *http.Response, err error) {
-	// var resp *http.Response
-	// opts := rest.Opts{
-	// 	Method:  req.Method,
-	// 	RootURL: req.URL.Scheme + "://" + req.URL.Host,
-	// 	Path:    req.URL.Path,
-	// 	Options: req.URL.RawQuery,
-	// }
-	// err = o.fs.pacer.Call(func() (bool, error) {
-	// 	resp, err = o.fs.srvRest.Call(ctx, &opts)
-	// 	return o.fs.shouldRetry(ctx, err)
-	// })
-
+func (f *Fs) _FetchDataWithRetries(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
 	f.pacer.Call(func() (bool, error) {
-		resp, err = client.Do(req)
-		if err != nil {
-			log.Default().Printf("Retrying fetch data, err: %s", err)
-		}
-		return err != nil, err
+		resp, err = f.srv.Call(ctx, opts)
+		return err != nil, fmt.Errorf("failed to fetch data, err: %w", err)
 	})
 
     return
 }
 
-func (f *Fs) _GetUnmarshaledResponse(ctx context.Context, url string, result interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	res, err := f._FetchDataWithRetries(fshttp.NewClient(ctx), req)
+func (f *Fs) _GetUnmarshaledResponse(ctx context.Context, opts *rest.Opts, result interface{}) error {
+	res, err := f._FetchDataWithRetries(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -315,16 +237,18 @@ func (f *Fs) _GetUnmarshaledResponse(ctx context.Context, url string, result int
 	return nil
 }
 
-func makeSearchQuery(name string, pid int, token string, pageNubmer int) string {
-	requestURL, _ := url.Parse("https://www.linkbox.to/api/open/file_search")
-	q := requestURL.Query()
-	q.Set("name", name)
-	q.Set("pid", strconv.Itoa(pid))
-	q.Set("token", token)
-	q.Set("pageNo", strconv.Itoa(pageNubmer))
-	q.Set("pageSize", strconv.Itoa(maxEntitiesPerPage))
-	requestURL.RawQuery = q.Encode()
-	return requestURL.String()
+func makeSearchQuery(name string, pid int, token string, pageNubmer int) *rest.Opts {
+	return &rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/file_search",
+		Parameters: url.Values{
+			"name": []string{name},
+			"pid":  []string{strconv.Itoa(pid)},
+			"token": []string{token},
+			"pageNo": []string{strconv.Itoa(pageNubmer)},
+			"pageSize": []string{strconv.Itoa(maxEntitiesPerPage)},
+		},
+	}
 }
 
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
@@ -334,20 +258,22 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 
 	pass, err := obscure.Reveal(f.opt.Password)
 	if err != nil {
-		return nil, fmt.Errorf("Error decoding password, obscure it?: %w", err)
+		return nil, fmt.Errorf("error decoding password, obscure it?: %w", err)
 	}
 
-	requestURL, _ := url.Parse("https://www.linkbox.to/api/user/login_email")
-	q := requestURL.Query()
-	q.Set("email", f.opt.Email)
-	q.Set("pwd", pass)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/user/login_email",
+		Parameters: url.Values{
+			"email": []string{f.opt.Email},
+			"pwd":   []string{pass},
+		},
+	}
 
-	requestURL.RawQuery = q.Encode()
-	response := LoginRes{}
-
-	err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.LoginRes{}
+	err = f._GetUnmarshaledResponse(ctx, &opts, &response)
 	if err != nil || response.Status != 1 {
-		return nil, fmt.Errorf("Error login: %w", err)
+		return nil, fmt.Errorf("error login: %w", err)
 	}
 
 	total := response.Data.UserInfo.SizeCap
@@ -367,7 +293,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 }
 
 func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
-	var responseResult FileSearchRes
+	var responseResult api.FileSearchRes
 	var files []*Object
 	var numberOfEntities int
 
@@ -385,10 +311,10 @@ func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
 
 	for numberOfEntities == maxEntitiesPerPage {
 		pageNumber++
-		requestURL := makeSearchQuery("", pid, f.opt.Token, pageNumber)
+		request := makeSearchQuery("", pid, f.opt.Token, pageNumber)
 
-		responseResult = FileSearchRes{}
-		err = f._GetUnmarshaledResponse(ctx, requestURL, &responseResult)
+		responseResult = api.FileSearchRes{}
+		err = f._GetUnmarshaledResponse(ctx, request, &responseResult)
 		if err != nil {
 			return nil, fmt.Errorf("parsing failed: %w", err)
 		}
@@ -471,20 +397,17 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, nil
 }
 
-func getObjectWithRetries(f* Fs, ctx context.Context, name string, pid int, token string) (entity Entity, err error) {
+func getObjectWithRetries(f* Fs, ctx context.Context, name string, pid int, token string) (entity api.Entity, err error) {
 	f.pacer.Call(func() (bool, error) {
 		entity, err = getObject(f, ctx, name, pid, token)
-		if err != nil {
-			log.Default().Printf("Retrying get object(%s), err: %s", name, err)
-		}
-		return err != nil, err
+		return err != nil, fmt.Errorf("failed to get object(%s), err: %w", name, err)
 	})
 
     return
 }
 
-func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (Entity, error) {
-	var newObject Entity
+func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (api.Entity, error) {
+	var newObject api.Entity
 
 	pageNumber := 0
 	numberOfEntities := maxEntitiesPerPage
@@ -492,15 +415,15 @@ func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (
 
 	for numberOfEntities == maxEntitiesPerPage {
 		pageNumber++
-		requestURL := makeSearchQuery("", pid, token, pageNumber)
+		request := makeSearchQuery("", pid, token, pageNumber)
 
-		searchResponse := FileSearchRes{}
-		err := f._GetUnmarshaledResponse(ctx, requestURL, &searchResponse)
+		searchResponse := api.FileSearchRes{}
+		err := f._GetUnmarshaledResponse(ctx, request, &searchResponse)
 		if err != nil {
-			return Entity{}, fmt.Errorf("unable to create new object: %w", err)
+			return api.Entity{}, fmt.Errorf("unable to create new object: %w", err)
 		}
 		if searchResponse.Status != 1 {
-			return Entity{}, fmt.Errorf("unable to create new object: %s", searchResponse.Message)
+			return api.Entity{}, fmt.Errorf("unable to create new object: %s", searchResponse.Message)
 		}
 		numberOfEntities = len(searchResponse.SearchData.Entities)
 
@@ -517,12 +440,12 @@ func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (
 		}
 
 		if pageNumber > 100000 {
-			return Entity{}, fmt.Errorf("too many results")
+			return api.Entity{}, fmt.Errorf("too many results")
 		}
 	}
 
 	if !newObjectIsFound {
-		return Entity{}, fs.ErrorObjectNotFound
+		return api.Entity{}, fs.ErrorObjectNotFound
 	}
 
 	return newObject, nil
@@ -539,7 +462,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) _NewObject(ctx context.Context, remote string, allowDir bool) (fs.Object, error) {
-	var newObject Entity
+	var newObject api.Entity
 	var dir, name string
 
 	fullPath := path.Join(f.root, remote)
@@ -555,7 +478,7 @@ func (f *Fs) _NewObject(ctx context.Context, remote string, allowDir bool) (fs.O
 		return nil, err
 	}
 
-	if newObject == (Entity{}) {
+	if newObject == (api.Entity{}) {
 		return nil, fs.ErrorObjectNotFound
 	}
 
@@ -634,22 +557,23 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 			return err
 		}
 
-		//"https://www.linkbox.to/api/open/folder_create"
-		requestURL, _ := url.Parse("https://www.linkbox.to/api/open/folder_create")
-		q := requestURL.Query()
-		q.Set("name", f.opt.Enc.FromStandardName(name))
-		q.Set("pid", strconv.Itoa(pid))
-		q.Set("token", f.opt.Token)
-		q.Set("isShare", "0")
-		q.Set("canInvite", "1")
-		q.Set("canShare", "1")
-		q.Set("withBodyImg", "1")
-		q.Set("desc", "")
+		opts := rest.Opts{
+			Method:  "GET",
+			RootURL: "https://www.linkbox.to/api/open/folder_create",
+			Parameters: url.Values{
+				"name": []string{f.opt.Enc.FromStandardName(name)},
+				"pid":  []string{strconv.Itoa(pid)},
+				"token": []string{f.opt.Token},
+				"isShare": []string{"0"},
+				"canInvite": []string{"1"},
+				"canShare": []string{"1"},
+				"withBodyImg": []string{"1"},
+				"desc": []string{""},
+			},
+		}
 
-		requestURL.RawQuery = q.Encode()
-		response := getResponse{}
-
-		err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+		response := api.CommonResponse{}
+		err = f._GetUnmarshaledResponse(ctx, &opts, &response)
 		if err != nil {
 			return fmt.Errorf("err in response")
 		}
@@ -662,8 +586,14 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		if response.Status != 1 && response.Status != 1501 {
 			return fmt.Errorf("could not create dir[%s]: %s", dir, response.Message)
 		}
-
 	}
+
+	// deflake when auto mkdir is needed in the middle of other fs apis
+	_, err := getIdByDirWithRetries(f, ctx, fullPath)
+	if err != nil {
+		return fmt.Errorf("server hasn't reflect Mkdir(%s)", dir)
+	}
+
 	return nil
 }
 
@@ -688,16 +618,17 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return err
 	}
 
-	//"https://www.linkbox.to/api/open/folder_del"
-	requestURL, _ := url.Parse("https://www.linkbox.to/api/open/folder_del")
-	q := requestURL.Query()
-	q.Set("dirIds", strconv.Itoa(dirIds))
-	q.Set("token", f.opt.Token)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/folder_del",
+		Parameters: url.Values{
+			"dirIds": []string{strconv.Itoa(dirIds)},
+			"token":  []string{f.opt.Token},
+		},
+	}
 
-	requestURL.RawQuery = q.Encode()
-
-	response := getResponse{}
-	err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.CommonResponse{}
+	err = f._GetUnmarshaledResponse(ctx, &opts, &response)
 
 	if err != nil {
 		return fmt.Errorf("err in response")
@@ -730,52 +661,48 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 }
 
 func (f *Fs) _ServerFolderEdit(ctx context.Context, dirId string, name string) error {
-	var requestURL *url.URL
-	var q url.Values
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/folder_edit",
+		Parameters: url.Values{
+			"dirId": []string{dirId},
+			"name": []string{f.opt.Enc.FromStandardName(name)},
+			"token": []string{f.opt.Token},
+			"canShare": []string{"1"},
+			"canInvite": []string{"1"},
+			"change_avatar": []string{"0"},
+			"desc": []string{""},
+		},
+	}
 
-	//"https://www.linkbox.to/api/open/folder_edit"
-	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_edit")
-	q = requestURL.Query()
-	q.Set("dirId", dirId)
-	q.Set("name", f.opt.Enc.FromStandardName(name))
-	q.Set("token", f.opt.Token)
-	q.Set("canShare", "1")
-	q.Set("canInvite", "1")
-	q.Set("change_avatar", "0")
-	q.Set("desc", "")
-
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
-
-	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.CommonResponse{}
+	err := f._GetUnmarshaledResponse(ctx, &opts, &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 {
-		return fmt.Errorf("Error folder_edit: %s", response.Message)
+		return fmt.Errorf("error folder_edit: %s", response.Message)
 	}
 
 	return nil
 }
 
 func (f *Fs) _ServerFolderMove(ctx context.Context, dirId string, pid string) error {
-	var requestURL *url.URL
-	var q url.Values
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/folder_move",
+		Parameters: url.Values{
+			"dirIds": []string{dirId},
+			"pid": []string{pid},
+			"token": []string{f.opt.Token},
+		},
+	}
 
-	//"https://www.linkbox.to/api/open/folder_move"
-	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/folder_move")
-	q = requestURL.Query()
-	q.Set("dirIds", dirId)
-	q.Set("pid", pid)
-	q.Set("token", f.opt.Token)
-
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
-
-	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.CommonResponse{}
+	err := f._GetUnmarshaledResponse(ctx, &opts, &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 {
-		return fmt.Errorf("Error folder_move: %s", response.Message)
+		return fmt.Errorf("error folder_move: %s", response.Message)
 	}
 
 	return nil
@@ -872,7 +799,11 @@ func (f *Fs) _MoveDir(ctx context.Context, srcObject *Object, dstRemote string) 
 		}
 	}
 
-	newObject, err := f._NewObject(ctx, dstRemote, true)
+	var newObject fs.Object
+	f.pacer.Call(func() (bool, error) {
+		newObject, err = f._NewObject(ctx, dstRemote, true)
+		return err != nil, fmt.Errorf("server hasn't reflect MoveDir(%s), err: %w", dstRemote, err)
+	})
 	if err != nil {
 		return nil, fs.ErrorCantDirMove
 	}
@@ -961,7 +892,12 @@ func (f *Fs) _MoveFile(ctx context.Context, srcObject *Object, remote string) (f
 		}
 	}
 
-	newObject, err := f.NewObject(ctx, remote)
+	var err error
+	var newObject fs.Object
+	f.pacer.Call(func() (bool, error) {
+		newObject, err = f.NewObject(ctx, remote)
+		return err != nil, fmt.Errorf("server hasn't reflect MoveFile(%s), err: %w", remote, err)
+	})
 	if err != nil {
 		return nil, fs.ErrorCantMove
 	}
@@ -970,48 +906,44 @@ func (f *Fs) _MoveFile(ctx context.Context, srcObject *Object, remote string) (f
 }
 
 func (f *Fs) _ServerFileRename(ctx context.Context, itemId string, name string) error {
-	var requestURL *url.URL
-	var q url.Values
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/file_rename",
+		Parameters: url.Values{
+			"itemId": []string{itemId},
+			"name": []string{name},
+			"token": []string{f.opt.Token},
+		},
+	}
 
-	//"https://www.linkbox.to/api/open/file_rename"
-	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_rename")
-	q = requestURL.Query()
-	q.Set("itemId", itemId)
-	q.Set("name", name)
-	q.Set("token", f.opt.Token)
-
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
-
-	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.CommonResponse{}
+	err := f._GetUnmarshaledResponse(ctx, &opts, &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 && response.Status != 1501 {
-		return fmt.Errorf("Error file_rename: %s", response.Message)
+		return fmt.Errorf("error file_rename: %s", response.Message)
 	}
 
 	return nil
 }
 
 func (f *Fs) _ServerFileMove(ctx context.Context, itemId string, pid string) error {
-	var requestURL *url.URL
-	var q url.Values
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/file_move",
+		Parameters: url.Values{
+			"itemIds": []string{itemId},
+			"pid":    []string{pid},
+			"token":  []string{f.opt.Token},
+		},
+	}
 
-	//"https://www.linkbox.to/api/open/file_move"
-	requestURL, _ = url.Parse("https://www.linkbox.to/api/open/file_move")
-	q = requestURL.Query()
-	q.Set("itemIds", itemId)
-	q.Set("pid", pid)
-	q.Set("token", f.opt.Token)
-
-	requestURL.RawQuery = q.Encode()
-	response := getResponse{}
-
-	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
+	response := api.CommonResponse{}
+	err := f._GetUnmarshaledResponse(ctx, &opts, &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 && response.Status != 1501 {
-		return fmt.Errorf("Error file_move: %s", response.Message)
+		return fmt.Errorf("error file_move: %s", response.Message)
 	}
 
 	return nil
@@ -1049,25 +981,21 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		if err != nil {
 			return nil, err
 		}
-		if newObject == (Entity{}) {
+		if newObject == (api.Entity{}) {
 			return nil, fs.ErrorObjectNotFound
 		}
 
 		downloadURL = newObject.URL
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("Open failed: %w", err)
-	}
 
 	fs.FixRangeOption(options, o.size)
-	fs.OpenOptionAddHTTPHeaders(req.Header, options)
-	if o.size == 0 {
-		// Don't supply range requests for 0 length objects as they always fail
-		delete(req.Header, "Range")
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: downloadURL,
+		Options: options,
 	}
 
-	res, err := o.fs._FetchDataWithRetries(fshttp.NewClient(ctx), req)
+	res, err := o.fs._FetchDataWithRetries(ctx, &opts)
 	if err != nil {
 		return nil, fmt.Errorf("Open failed: %w", err)
 	}
@@ -1102,15 +1030,18 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	requestURL, _ := url.Parse("https://www.linkbox.to/api/open/get_upload_url")
-	q := requestURL.Query()
-	q.Set("fileMd5ofPre10m", fmt.Sprintf("%x", h.Sum(nil)))
-	q.Set("fileSize", strconv.FormatInt(src.Size(), 10))
-	q.Set("token", o.fs.opt.Token)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/get_upload_url",
+		Parameters: url.Values{
+			"fileMd5ofPre10m": []string{fmt.Sprintf("%x", h.Sum(nil))},
+			"fileSize":        []string{strconv.FormatInt(src.Size(), 10)},
+			"token":           []string{o.fs.opt.Token},
+		},
+	}
 
-	requestURL.RawQuery = q.Encode()
-	getFistStepResult := getUploadUrlResponse{}
-	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &getFistStepResult)
+	getFistStepResult := api.UploadUrlResponse{}
+	err = o.fs._GetUnmarshaledResponse(ctx, &opts, &getFistStepResult)
 	if err != nil {
 		return err
 	}
@@ -1118,13 +1049,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	switch getFistStepResult.Status {
 	case 1:
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
-		req, err := http.NewRequestWithContext(ctx, "PUT", getFistStepResult.Data.SignUrl, file)
 
-		if err != nil {
-			return err
+		opts = rest.Opts{
+			Method:  "PUT",
+			RootURL: getFistStepResult.Data.SignUrl,
+			Body:    file,
 		}
 
-		res, err := o.fs._FetchDataWithRetries(fshttp.NewClient(ctx), req)
+		res, err := o.fs._FetchDataWithRetries(ctx, &opts)
 		if err != nil {
 			return err
 		}
@@ -1139,11 +1071,6 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		// We need only to make second step
 	default:
 		return fmt.Errorf("get unexpected message from Linkbox: %s", getFistStepResult.Message)
-	}
-
-	requestURL, err = url.Parse("https://www.linkbox.to/api/open/folder_upload_file")
-	if err != nil {
-		return err
 	}
 
 	fullPath := path.Join(o.fs.root, o.Remote())
@@ -1161,16 +1088,20 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
-	q = requestURL.Query()
-	q.Set("fileMd5ofPre10m", fmt.Sprintf("%x", h.Sum(nil)))
-	q.Set("fileSize", strconv.FormatInt(src.Size(), 10))
-	q.Set("pid", strconv.Itoa(pid))
-	q.Set("diyName", o.fs.opt.Enc.FromStandardName(name))
-	q.Set("token", o.fs.opt.Token)
+	opts = rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/folder_upload_file",
+		Parameters: url.Values{
+			"fileMd5ofPre10m": []string{fmt.Sprintf("%x", h.Sum(nil))},
+			"fileSize":        []string{strconv.FormatInt(src.Size(), 10)},
+			"pid":             []string{strconv.Itoa(pid)},
+			"diyName":         []string{o.fs.opt.Enc.FromStandardName(name)},
+			"token":           []string{o.fs.opt.Token},
+		},
+	}
 
-	requestURL.RawQuery = q.Encode()
-	getSecondStepResult := getUploadFileResponse{}
-	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &getSecondStepResult)
+	getSecondStepResult := api.UploadFileResponse{}
+	err = o.fs._GetUnmarshaledResponse(ctx, &opts, &getSecondStepResult)
 	if err != nil {
 		return err
 	}
@@ -1179,7 +1110,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	newObject, err := getObjectWithRetries(o.fs, ctx, name, pid, o.fs.opt.Token)
-	if err != nil || newObject == (Entity{}) {
+	if err != nil || newObject == (api.Entity{}) {
 		if getSecondStepResult.Data.ItemID != "" {
 			log.Default().Printf(
 				"Fallback to directly update object from response as getObjectWithRetries(%s) failed",
@@ -1211,18 +1142,17 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 // Removes this object
 func (o *Object) Remove(ctx context.Context) error {
-	//https://www.linkbox.to/api/open/file_del
-
-	requestURL, err := url.Parse("https://www.linkbox.to/api/open/file_del")
-	if err != nil {
-		log.Fatal(err)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/open/file_del",
+		Parameters: url.Values{
+			"itemIds": []string{o.itemId},
+			"token":   []string{o.fs.opt.Token},
+		},
 	}
-	q := requestURL.Query()
-	q.Set("itemIds", o.itemId)
-	q.Set("token", o.fs.opt.Token)
-	requestURL.RawQuery = q.Encode()
-	requstResult := getUploadUrlResponse{}
-	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &requstResult)
+
+	requstResult := api.UploadUrlResponse{}
+	err := o.fs._GetUnmarshaledResponse(ctx, &opts, &requstResult)
 	if err != nil {
 		return err
 	}
@@ -1231,15 +1161,13 @@ func (o *Object) Remove(ctx context.Context) error {
 		return fmt.Errorf("get unexpected message from Linkbox: %s", requstResult.Message)
 	}
 
-	// Deflake rmdir-right-after-remove
+	// deflake rmdir-right-after-remove
 	o.fs.pacer.Call(func() (bool, error) {
 		_, err = o.fs.NewObject(ctx, o.Remote())
 		if (err == fs.ErrorObjectNotFound) {
 			return false, nil
 		}
-		return true, fmt.Errorf("Retrying as server hasn't reflected file(%s) removal", o.Remote())
-
-
+		return true, fmt.Errorf("server hasn't reflected file(%s) removal", o.Remote())
 	})
 
 	return nil
@@ -1331,37 +1259,6 @@ func (f *Fs) Precision() time.Duration {
 // Hashes returns hash.HashNone to indicate remote hashing is unavailable
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.None)
-}
-
-/*
-	{
-	  "data": {
-	    "signUrl": "http://xx -- Then CURL PUT your file with sign url "
-	  },
-	  "msg": "please use this url to upload (PUT method)",
-	  "status": 1
-	}
-*/
-type getResponse struct {
-	Message string `json:"msg"`
-	Status  int    `json:"status"`
-}
-
-type getUploadUrlData struct {
-	SignUrl string `json:"signUrl"`
-}
-
-type getUploadUrlResponse struct {
-	Data getUploadUrlData `json:"data"`
-	getResponse
-}
-
-type getUploadFileResponse struct {
-	Data struct {
-		ItemID string `json:"itemId"`
-	} `json:"data"`
-	Msg    string `json:"msg"`
-	Status int    `json:"status"`
 }
 
 // Put in to the remote path with the modTime given of the given size
