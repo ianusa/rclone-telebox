@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/avast/retry-go"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -25,10 +24,19 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/rest"
 )
 
 var (
+
+)
+
+const (
 	maxEntitiesPerPage = 64
+	minSleep           = 20 * time.Millisecond
+	maxSleep           = 4 * time.Second
+	decayConstant      = 2
 )
 
 func init() {
@@ -73,6 +81,8 @@ type Fs struct {
 	opt      Options        // options for this backend
 	features *fs.Features   // optional features
 	ci       *fs.ConfigInfo // global config
+	srv      *rest.Client   // the connection to the server
+	pacer    *fs.Pacer      // pacer for API calls
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -107,6 +117,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root: root,
 		opt:  *opt,
 		ci:   ci,
+		srv:   rest.NewClient(fshttp.NewClient(ctx)),
+		pacer: fs.NewPacer(
+			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
+			pacer.MaxSleep(maxSleep),
+			pacer.DecayConstant(decayConstant))),
 	}
 
 	f.features = (&fs.Features{
@@ -185,23 +200,13 @@ type LoginRes struct {
 }
 
 func getIdByDirWithRetries(f *Fs, ctx context.Context, dir string) (pid int, err error) {
-    retry.Do(
-        func() error {
-            pid, err = getIdByDir(f, ctx, dir)
-            return err
-        },
-        retry.RetryIf(
-            func(error) bool {
-                log.Default().Printf("Error get dirId(%s): %s", dir, err)
-                return true
-            }),
-        retry.OnRetry(func(try uint, orig error) {
-            log.Default().Printf("Retrying to get dirId(%s). Attempt: %d", dir, try + 2)
-        }),
-        retry.Attempts(3),
-        retry.Delay(1*time.Second),
-        retry.MaxJitter(1*time.Second),
-    )
+	f.pacer.Call(func() (bool, error) {
+		pid, err = getIdByDir(f, ctx, dir)
+		if err != nil {
+			log.Default().Printf("Retrying get dirId(%s), err: %s", dir, err)
+		}
+		return err != nil, err
+	})
 
     return
 }
@@ -225,7 +230,7 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 			pageNumber++
 			requestURL := makeSearchQuery("", pid, f.opt.Token, pageNumber)
 			responseResult := FileSearchRes{}
-			err := getUnmarshaledResponse(ctx, requestURL, &responseResult)
+			err := f._GetUnmarshaledResponse(ctx, requestURL, &responseResult)
 			numberOfEntities = len(responseResult.SearchData.Entities)
 
 			if err != nil {
@@ -263,35 +268,37 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	return pid, nil
 }
 
-func fetchDataWithRetries(client *http.Client, req *http.Request) (resp *http.Response, err error) {
-    retry.Do(
-        func() error {
-            resp, err = client.Do(req)
-            return err
-        },
-        retry.RetryIf(
-            func(error) bool {
-                log.Default().Printf("Error fetching data: %s", err)
-                return true
-            }),
-        retry.OnRetry(func(try uint, orig error) {
-            log.Default().Printf("Retrying to fetch data. Attempt: %d", try + 2)
-        }),
-        retry.Attempts(3),
-        retry.Delay(3*time.Second),
-        retry.MaxJitter(1*time.Second),
-    )
+func (f *Fs) _FetchDataWithRetries(client *http.Client, req *http.Request) (resp *http.Response, err error) {
+	// var resp *http.Response
+	// opts := rest.Opts{
+	// 	Method:  req.Method,
+	// 	RootURL: req.URL.Scheme + "://" + req.URL.Host,
+	// 	Path:    req.URL.Path,
+	// 	Options: req.URL.RawQuery,
+	// }
+	// err = o.fs.pacer.Call(func() (bool, error) {
+	// 	resp, err = o.fs.srvRest.Call(ctx, &opts)
+	// 	return o.fs.shouldRetry(ctx, err)
+	// })
+
+	f.pacer.Call(func() (bool, error) {
+		resp, err = client.Do(req)
+		if err != nil {
+			log.Default().Printf("Retrying fetch data, err: %s", err)
+		}
+		return err != nil, err
+	})
 
     return
 }
 
-func getUnmarshaledResponse(ctx context.Context, url string, result interface{}) error {
+func (f *Fs) _GetUnmarshaledResponse(ctx context.Context, url string, result interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
+	res, err := f._FetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return err
 	}
@@ -338,7 +345,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	requestURL.RawQuery = q.Encode()
 	response := LoginRes{}
 
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 	if err != nil || response.Status != 1 {
 		return nil, fmt.Errorf("Error login: %w", err)
 	}
@@ -381,7 +388,7 @@ func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
 		requestURL := makeSearchQuery("", pid, f.opt.Token, pageNumber)
 
 		responseResult = FileSearchRes{}
-		err = getUnmarshaledResponse(ctx, requestURL, &responseResult)
+		err = f._GetUnmarshaledResponse(ctx, requestURL, &responseResult)
 		if err != nil {
 			return nil, fmt.Errorf("parsing failed: %w", err)
 		}
@@ -465,23 +472,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 }
 
 func getObjectWithRetries(f* Fs, ctx context.Context, name string, pid int, token string) (entity Entity, err error) {
-    retry.Do(
-        func() error {
-            entity, err = getObject(f, ctx, name, pid, token)
-            return err
-        },
-        retry.RetryIf(
-            func(error) bool {
-                log.Default().Printf("Error get object(%s): %s", name, err)
-                return true
-            }),
-        retry.OnRetry(func(try uint, orig error) {
-            log.Default().Printf("Retrying to get object(%s). Attempt: %d", name, try + 2)
-        }),
-        retry.Attempts(3),
-        retry.Delay(3*time.Second),
-        retry.MaxJitter(1*time.Second),
-    )
+	f.pacer.Call(func() (bool, error) {
+		entity, err = getObject(f, ctx, name, pid, token)
+		if err != nil {
+			log.Default().Printf("Retrying get object(%s), err: %s", name, err)
+		}
+		return err != nil, err
+	})
 
     return
 }
@@ -498,7 +495,7 @@ func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (
 		requestURL := makeSearchQuery("", pid, token, pageNumber)
 
 		searchResponse := FileSearchRes{}
-		err := getUnmarshaledResponse(ctx, requestURL, &searchResponse)
+		err := f._GetUnmarshaledResponse(ctx, requestURL, &searchResponse)
 		if err != nil {
 			return Entity{}, fmt.Errorf("unable to create new object: %w", err)
 		}
@@ -652,7 +649,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 		requestURL.RawQuery = q.Encode()
 		response := getResponse{}
 
-		err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
+		err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 		if err != nil {
 			return fmt.Errorf("err in response")
 		}
@@ -700,7 +697,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	requestURL.RawQuery = q.Encode()
 
 	response := getResponse{}
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err = f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 
 	if err != nil {
 		return fmt.Errorf("err in response")
@@ -750,7 +747,7 @@ func (f *Fs) _ServerFolderEdit(ctx context.Context, dirId string, name string) e
 	requestURL.RawQuery = q.Encode()
 	response := getResponse{}
 
-	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 {
@@ -774,7 +771,7 @@ func (f *Fs) _ServerFolderMove(ctx context.Context, dirId string, pid string) er
 	requestURL.RawQuery = q.Encode()
 	response := getResponse{}
 
-	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 {
@@ -986,7 +983,7 @@ func (f *Fs) _ServerFileRename(ctx context.Context, itemId string, name string) 
 	requestURL.RawQuery = q.Encode()
 	response := getResponse{}
 
-	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 && response.Status != 1501 {
@@ -1010,7 +1007,7 @@ func (f *Fs) _ServerFileMove(ctx context.Context, itemId string, pid string) err
 	requestURL.RawQuery = q.Encode()
 	response := getResponse{}
 
-	err := getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	err := f._GetUnmarshaledResponse(ctx, requestURL.String(), &response)
 	if err != nil {
 		return err
 	} else if response.Status != 1 && response.Status != 1501 {
@@ -1070,7 +1067,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		delete(req.Header, "Range")
 	}
 
-	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
+	res, err := o.fs._FetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return nil, fmt.Errorf("Open failed: %w", err)
 	}
@@ -1113,7 +1110,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	requestURL.RawQuery = q.Encode()
 	getFistStepResult := getUploadUrlResponse{}
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &getFistStepResult)
+	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &getFistStepResult)
 	if err != nil {
 		return err
 	}
@@ -1127,7 +1124,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			return err
 		}
 
-		res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
+		res, err := o.fs._FetchDataWithRetries(fshttp.NewClient(ctx), req)
 		if err != nil {
 			return err
 		}
@@ -1173,7 +1170,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	requestURL.RawQuery = q.Encode()
 	getSecondStepResult := getUploadFileResponse{}
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &getSecondStepResult)
+	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &getSecondStepResult)
 	if err != nil {
 		return err
 	}
@@ -1225,7 +1222,7 @@ func (o *Object) Remove(ctx context.Context) error {
 	q.Set("token", o.fs.opt.Token)
 	requestURL.RawQuery = q.Encode()
 	requstResult := getUploadUrlResponse{}
-	err = getUnmarshaledResponse(ctx, requestURL.String(), &requstResult)
+	err = o.fs._GetUnmarshaledResponse(ctx, requestURL.String(), &requstResult)
 	if err != nil {
 		return err
 	}
@@ -1235,25 +1232,15 @@ func (o *Object) Remove(ctx context.Context) error {
 	}
 
 	// Deflake rmdir-right-after-remove
-	retry.Do(
-        func() error {
-            _, err = o.fs.NewObject(ctx, o.Remote())
-            if (err == fs.ErrorObjectNotFound) {
-				return nil
-			}
-			return fmt.Errorf("server hasn't reflected file(%s) removal", o.Remote())
-        },
-        retry.RetryIf(
-            func(error) bool {
-                return true
-            }),
-        retry.OnRetry(func(try uint, orig error) {
-            log.Default().Printf("%s. Attempt: %d", orig, try + 2)
-        }),
-        retry.Attempts(3),
-        retry.Delay(3*time.Second),
-        retry.MaxJitter(1*time.Second),
-    )
+	o.fs.pacer.Call(func() (bool, error) {
+		_, err = o.fs.NewObject(ctx, o.Remote())
+		if (err == fs.ErrorObjectNotFound) {
+			return false, nil
+		}
+		return true, fmt.Errorf("Retrying as server hasn't reflected file(%s) removal", o.Remote())
+
+
+	})
 
 	return nil
 }
