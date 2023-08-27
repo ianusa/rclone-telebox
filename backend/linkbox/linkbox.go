@@ -17,9 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/avast/retry-go"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 )
@@ -37,6 +39,14 @@ func init() {
 			Name:     "token",
 			Help:     "Token from https://www.linkbox.to/admin/account",
 			Required: true,
+		}, {
+			Name:      "email",
+			Help:      "The email for https://www.linkbox.to/api/user/login_email?email={email}",
+			Sensitive: true,
+		}, {
+			Name:       "password",
+			Help:       "The password for https://www.linkbox.to/api/user/login_email?pwd={password}",
+			IsPassword: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -45,6 +55,8 @@ func init() {
 // Options defines the configuration for this backend
 type Options struct {
 	Token string `config:"token"`
+	Email string `config:"email"`
+	Password string `config:"password"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -115,6 +127,42 @@ type FileSearchRes struct {
 	Message    string `json:"msg"`
 }
 
+type LoginRes struct {
+	Data struct {
+		Avatar       string `json:"avatar"`
+		Nickname     string `json:"nickname"`
+		OpenID       string `json:"openId"`
+		RefreshToken string `json:"refresh_token"`
+		Token        string `json:"token"`
+		UID          int    `json:"uid"`
+		UserInfo     struct {
+			APIKey         string `json:"api_key"`
+			AutoRenew      bool   `json:"auto_renew"`
+			Avatar         string `json:"avatar"`
+			BuyP7          bool   `json:"buy_p7"`
+			Email          string `json:"email"`
+			FavFlag        bool   `json:"fav_flag"`
+			GroupPLimitCnt int    `json:"group_p_limit_cnt"`
+			IsTry          bool   `json:"is_try"`
+			Nickname       string `json:"nickname"`
+			OpenID         string `json:"open_id"`
+			SetPrivacy     int    `json:"set_privacy"`
+			SizeCap        int64  `json:"size_cap"`
+			SizeCurr       int    `json:"size_curr"`
+			State          int    `json:"state"`
+			SubAutoRenew   int    `json:"sub_auto_renew"`
+			SubOrderID     int    `json:"sub_order_id"`
+			SubPid         int    `json:"sub_pid"`
+			SubSource      int    `json:"sub_source"`
+			SubType        int    `json:"sub_type"`
+			UID            int    `json:"uid"`
+			VipEnd         int    `json:"vip_end"`
+			VipLv          int    `json:"vip_lv"`
+		} `json:"userInfo"`
+	} `json:"data"`
+	Status int `json:"status"`
+}
+
 func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	if dir == "" || dir == "/" {
 		return 0, nil // we assume that it is root directory
@@ -170,13 +218,36 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	return pid, nil
 }
 
+func fetchDataWithRetries(client *http.Client, req *http.Request) (resp *http.Response, err error) {
+    retry.Do(
+        func() error {
+            resp, err = client.Do(req)
+            return err
+        },
+        retry.RetryIf(
+            func(error) bool {
+                log.Default().Printf("Error fetching data: %s", err)
+                return true
+            }),
+        retry.OnRetry(func(try uint, orig error) {
+            log.Default().Printf("Retrying to fetch data. Attempt: %d", try + 2)
+        }),
+        retry.Attempts(3),
+        retry.Delay(3*time.Second),
+        retry.MaxJitter(1*time.Second),
+    )
+
+    return
+}
+
 func getUnmarshaledResponse(ctx context.Context, url string, result interface{}) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	res, err := fshttp.NewClient(ctx).Do(req)
+	//res, err := fshttp.NewClient(ctx).Do(req)
+	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return err
 	}
@@ -203,6 +274,38 @@ func makeSearchQuery(name string, pid int, token string, pageNubmer int) string 
 	q.Set("pageSize", strconv.Itoa(maxEntitiesPerPage))
 	requestURL.RawQuery = q.Encode()
 	return requestURL.String()
+}
+
+func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
+	if (f.opt.Email == "") || (f.opt.Password == "") {
+		return nil, fmt.Errorf("email and password are required")
+	}
+
+	pass, err := obscure.Reveal(f.opt.Password)
+	if err != nil {
+		return nil, fmt.Errorf("Error decoding password, obscure it?: %w", err)
+	}
+
+	requestURL, _ := url.Parse("https://www.linkbox.to/api/user/login_email")
+	q := requestURL.Query()
+	q.Set("email", f.opt.Email)
+	q.Set("pwd", pass)
+
+	requestURL.RawQuery = q.Encode()
+	response := LoginRes{}
+
+	err = getUnmarshaledResponse(ctx, requestURL.String(), &response)
+	if err != nil || response.Status != 1 {
+		return nil, fmt.Errorf("Error login: %w", err)
+	}
+
+	usage = &fs.Usage{
+		Total: fs.NewUsageValue(response.Data.UserInfo.SizeCap),
+		Used:  fs.NewUsageValue(int64(response.Data.UserInfo.SizeCurr)),
+		Free: fs.NewUsageValue(response.Data.UserInfo.SizeCap - int64(response.Data.UserInfo.SizeCurr)),
+	}
+
+	return usage, nil
 }
 
 func parse(f *Fs, ctx context.Context, dir string) ([]*Object, error) {
@@ -596,7 +699,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		delete(req.Header, "Range")
 	}
 
-	res, err := fshttp.NewClient(ctx).Do(req)
+	//res, err := fshttp.NewClient(ctx).Do(req)
+	res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 	if err != nil {
 		return nil, fmt.Errorf("Open failed: %w", err)
 	}
@@ -653,8 +757,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			return err
 		}
 
-		res, err := fshttp.NewClient(ctx).Do(req)
-
+		//res, err := fshttp.NewClient(ctx).Do(req)
+		res, err := fetchDataWithRetries(fshttp.NewClient(ctx), req)
 		if err != nil {
 			return err
 		}
