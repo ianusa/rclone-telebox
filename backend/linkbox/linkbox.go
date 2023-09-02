@@ -29,10 +29,6 @@ import (
 	"github.com/rclone/rclone/lib/rest"
 )
 
-var (
-
-)
-
 const (
 	maxEntitiesPerPage = 64
 	minSleep           = 50 * time.Millisecond // Server sometimes reflects changes slowly
