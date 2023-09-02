@@ -167,6 +167,7 @@ require (
 	github.com/golang-jwt/jwt/v4 v4.5.0
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
+	github.com/juicedata/huaweicloud-sdk-go-obs v3.22.11+incompatible
 	github.com/pkg/xattr v0.4.9
 	golang.org/x/mobile v0.0.0-20230531173138-3c911d8e3eda
 	golang.org/x/term v0.12.0

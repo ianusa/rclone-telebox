@@ -57,6 +57,29 @@ type LoginRes struct {
 	Status int `json:"status"`
 }
 
+type FileUploadSessionRes struct {
+	Data struct {
+		Ak       string `json:"ak"`
+		Bucket   string `json:"bucket"`
+		PoolPath string `json:"poolPath"`
+		SToken   string `json:"sToken"`
+		Server   string `json:"server"`
+		Sk       string `json:"sk"`
+		Ts       int    `json:"ts"`
+	} `json:"data"`
+	Status  int `json:"status"`
+	Message string `json:"msg"`
+}
+
+type CreateItemRes struct {
+	Data struct {
+		ItemID    string `json:"itemId"`
+		Path      string `json:"path"`
+	} `json:"data"`
+	Status int `json:"status"`
+	Message string `json:"msg"`
+}
+
 type CommonResponse struct {
 	Message string `json:"msg"`
 	Status  int    `json:"status"`

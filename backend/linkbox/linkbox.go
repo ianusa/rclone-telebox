@@ -11,11 +11,13 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/juicedata/huaweicloud-sdk-go-obs/obs"
 	"github.com/rclone/rclone/backend/linkbox/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -34,6 +36,7 @@ const (
 	minSleep           = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep           = 4 * time.Second
 	decayConstant      = 2
+	partSize int64     = 5 * 1024 * 1024
 )
 
 func init() {
@@ -58,6 +61,11 @@ func init() {
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
 			Default: encoder.EncodeInvalidUtf8,
+		}, {
+			Name:     "multipart_upload",
+			Help: `If true use OBS multipart-upload mode wnere possible, else use default Linkbox API upload mode`,
+			Default:  true,
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -69,6 +77,7 @@ type Options struct {
 	Email string             `config:"email"`
 	Password string          `config:"password"`
 	Enc encoder.MultiEncoder `config:"encoding"`
+	MultipartUpload bool `config:"multipart_upload"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -80,6 +89,7 @@ type Fs struct {
 	ci       *fs.ConfigInfo // global config
 	srv      *rest.Client   // the connection to the server
 	pacer    *fs.Pacer      // pacer for API calls
+	accToken string         // account token
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -119,6 +129,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
 			pacer.MaxSleep(maxSleep),
 			pacer.DecayConstant(decayConstant))),
+		accToken: "",
+	}
+
+	f._UpdateAccountToken(ctx)
+
+	// Account token is the prerequisite for OBS multipart uploads
+	// If it is not available, fall back to the default API upload mode
+	if f.accToken == "" {
+		f.opt.MultipartUpload = false
 	}
 
 	f.features = (&fs.Features{
@@ -245,6 +264,34 @@ func makeSearchQuery(name string, pid int, token string, pageNubmer int) *rest.O
 			"pageSize": []string{strconv.Itoa(maxEntitiesPerPage)},
 		},
 	}
+}
+
+func (f *Fs) _UpdateAccountToken(ctx context.Context) {
+	if (f.opt.Email == "") || (f.opt.Password == "") {
+		return
+	}
+
+	pass, err := obscure.Reveal(f.opt.Password)
+	if err != nil {
+		return
+	}
+
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/user/login_email",
+		Parameters: url.Values{
+			"email": []string{f.opt.Email},
+			"pwd":   []string{pass},
+		},
+	}
+
+	response := api.LoginRes{}
+	err = f._GetUnmarshaledResponse(ctx, &opts, &response)
+	if err != nil || response.Status != 1 {
+		return
+	}
+
+	f.accToken = response.Data.Token
 }
 
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
@@ -999,12 +1046,291 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return res.Body, nil
 }
 
+func UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64) error {
+	file, err := os.CreateTemp("", "linkbox_multipart_upload_*")
+	if err != nil {
+		return fmt.Errorf("failed to create multipart file: %w", err)
+	}
+
+	defer func(fd *os.File) {
+		for _, err := range [...]error{fd.Close(), os.Remove(fd.Name())} {
+			if err != nil {
+				log.Default().Printf("failed to remove multipart file(%s): %s", file.Name(), err)
+			}
+		}
+	}(file)
+
+	_, err = io.Copy(file, *in)
+	if err != nil {
+		return fmt.Errorf("failed to copy data to temp file(%s): %w", file.Name(), err)
+	}
+
+	obsClient, err := obs.New(
+		metadata.Data.Ak,
+		metadata.Data.Sk,
+		metadata.Data.Server,
+		obs.WithSecurityToken(metadata.Data.SToken),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create obs client: %w", err)
+	}
+
+	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
+	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
+	initiateMultipartUploadInput.Key = metadata.Data.PoolPath
+	initiateMultipartUploadOutput, err := obsClient.InitiateMultipartUpload(initiateMultipartUploadInput)
+	if err != nil {
+		return fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	partCount := int(inSize / partSize)
+	if inSize % partSize != 0 {
+		partCount++
+	}
+	partChan := make(chan obs.Part, 5)
+
+	for i := 0; i < partCount; i++ {
+		partNumber := i + 1
+		offset := int64(i) * partSize
+		currPartSize := partSize
+		if i+1 == partCount {
+			currPartSize = inSize - offset
+		}
+		go func(index int, offset, partSize int64) {
+			uploadPartInput := &obs.UploadPartInput{}
+			uploadPartInput.Bucket = metadata.Data.Bucket
+			uploadPartInput.Key = metadata.Data.PoolPath
+			uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
+			uploadPartInput.SourceFile = file.Name()
+			uploadPartInput.PartNumber = index
+			uploadPartInput.Offset = offset
+			uploadPartInput.PartSize = partSize
+			uploadPartInputOutput, err := obsClient.UploadPart(uploadPartInput)
+			if err == nil {
+				partChan <- obs.Part{ETag: uploadPartInputOutput.ETag, PartNumber: uploadPartInputOutput.PartNumber}
+			} else {
+				partChan <- obs.Part{ETag: "", PartNumber: -1}
+			}
+		}(partNumber, offset, currPartSize)
+	}
+
+	parts := make([]obs.Part, 0, partCount)
+
+	numFailedParts := 0
+	for {
+		part, ok := <-partChan
+		if !ok {
+			break
+		}
+		if part.PartNumber == -1 {
+			numFailedParts++
+		}
+		parts = append(parts, part)
+		if len(parts) == partCount {
+			close(partChan)
+		}
+	}
+
+	if numFailedParts > 0 {
+		return fmt.Errorf("%d parts failed to upload", numFailedParts)
+	}
+
+	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
+	completeMultipartUploadInput.Bucket = metadata.Data.Bucket
+	completeMultipartUploadInput.Key = metadata.Data.PoolPath
+	completeMultipartUploadInput.UploadId = initiateMultipartUploadOutput.UploadId
+	completeMultipartUploadInput.Parts = parts
+	_, err = obsClient.CompleteMultipartUpload(completeMultipartUploadInput)
+	if err != nil {
+		return fmt.Errorf("failed to complete part: %w", err)
+	}
+
+	return nil
+}
+
+func UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
+	obsClient, err := obs.New(
+		metadata.Data.Ak,
+		metadata.Data.Sk,
+		metadata.Data.Server,
+		obs.WithSecurityToken(metadata.Data.SToken),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create obs client: %w", err)
+	}
+
+	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
+	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
+	initiateMultipartUploadInput.Key = metadata.Data.PoolPath
+	initiateMultipartUploadOutput, err := obsClient.InitiateMultipartUpload(initiateMultipartUploadInput)
+	if err != nil {
+		return fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	uploadPartInput := &obs.UploadPartInput{}
+	uploadPartInput.Bucket = metadata.Data.Bucket
+	uploadPartInput.Key = metadata.Data.PoolPath
+	uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
+	uploadPartInput.PartNumber = 1
+	uploadPartInput.Body = *in
+	uploadPartOutput, err := obsClient.UploadPart(uploadPartInput)
+	if err != nil {
+		return fmt.Errorf("failed to upload part: %w", err)
+	}
+
+	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
+	completeMultipartUploadInput.Bucket = metadata.Data.Bucket
+	completeMultipartUploadInput.Key = metadata.Data.PoolPath
+	completeMultipartUploadInput.UploadId = initiateMultipartUploadOutput.UploadId
+	completeMultipartUploadInput.Parts = []obs.Part{
+		{PartNumber: uploadPartOutput.PartNumber, ETag: uploadPartOutput.ETag},
+	}
+	_, err = obsClient.CompleteMultipartUpload(completeMultipartUploadInput)
+	if err != nil {
+		return fmt.Errorf("failed to complete part: %w", err)
+	}
+
+	return nil
+}
+
+func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if src.Size() == 0 {
+		return fs.ErrorCantUploadEmptyFiles
+	}
+
+	tmpObject, err := o.fs.NewObject(ctx, o.Remote())
+
+	if err == nil {
+		_ = tmpObject.Remove(ctx)
+	}
+
+	h := md5.New()
+	first10m := io.LimitReader(in, 10_485_760)
+	first10mBytes, err := io.ReadAll(first10m)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(h, bytes.NewReader(first10mBytes)); err != nil {
+		return err
+	}
+
+	vgroup := fmt.Sprintf("%x", h.Sum(nil)) + "_" + strconv.FormatInt(src.Size(), 10)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/file/get_file_upload_session",
+		Parameters: url.Values{
+			"scene":           []string{"common"},
+			"vgroupType":      []string{"md5_10m"},
+			"vgroup":          []string{vgroup},
+			"token":           []string{o.fs.accToken},
+		},
+	}
+
+	fileUploadSessionRes := api.FileUploadSessionRes{}
+	err = o.fs._GetUnmarshaledResponse(ctx, &opts, &fileUploadSessionRes)
+	if err != nil {
+		return err
+	}
+
+	switch fileUploadSessionRes.Status {
+	case 1:
+		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
+		if src.Size() > partSize {
+			err = UploadParts(&file, &fileUploadSessionRes, src.Size())
+		} else {
+			err = UploadOnePart(&file, &fileUploadSessionRes)
+		}
+
+		if err != nil {
+			return err
+		}
+	case 600:
+		// Status means that we don't need to upload file
+		// We need only to make second step
+	default:
+		return fmt.Errorf("get unexpected message from Linkbox: %s", fileUploadSessionRes.Message)
+	}
+
+	fullPath := path.Join(o.fs.root, o.Remote())
+	fullPath = strings.TrimPrefix(fullPath, "/")
+
+	pdir, name := splitDirAndName(fullPath)
+	pdirToCreateIfNotExists, _ := splitDirAndName(o.Remote())
+
+	pid, err := getIdByDir(o.fs, ctx, pdir)
+	if err == fs.ErrorDirNotFound && o.fs.Mkdir(ctx, pdirToCreateIfNotExists) == nil {
+		pid, err = getIdByDirWithRetries(o.fs, ctx, pdir)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	filename := o.fs.opt.Enc.FromStandardName(name)
+	opts = rest.Opts{
+		Method:  "GET",
+		RootURL: "https://www.linkbox.to/api/file/create_item",
+		Parameters: url.Values{
+			"diyName":    []string{filename},
+			"filename":   []string{filename},
+			"pid":        []string{strconv.Itoa(pid)},
+			"vgroup":     []string{vgroup},
+			"vgroupType": []string{"md5_10m"},
+			"token":      []string{o.fs.accToken},
+		},
+	}
+
+	createItemRes := api.CreateItemRes{}
+	err = o.fs._GetUnmarshaledResponse(ctx, &opts, &createItemRes)
+	if err != nil {
+		return err
+	}
+	if createItemRes.Status != 1 {
+		return fmt.Errorf("get bad status from linkbox: %s", createItemRes.Message)
+	}
+
+	newObject, err := getObjectWithRetries(o.fs, ctx, name, pid, o.fs.opt.Token)
+	if err != nil || newObject == (api.Entity{}) {
+		if createItemRes.Data.ItemID != "" {
+			log.Default().Printf(
+				"Fallback to directly update object from response as getObjectWithRetries(%s) failed",
+				name)
+			o.pid = pid
+			o.itemId = createItemRes.Data.ItemID
+			o.remote = o.Remote()
+			o.size = src.Size()
+			o.modTime = time.Now()
+			return nil
+		}
+		log.Default().Printf(
+			"Failed both getObjectWithRetries(%s) and direct object update", name)
+	}
+
+	o.pid = pid
+	o.fullURL = newObject.URL
+	o.id = newObject.ID
+	o.itemId = newObject.ItemID
+	o.isDir = newObject.Type == "dir" || newObject.Type == "sdir"
+	o.contentType = newObject.Type
+	o.subType = newObject.SubType
+	o.remote = o.Remote()
+	o.modTime = time.Unix(newObject.Ctime, 0)
+	o.size = src.Size()
+
+	return nil
+}
+
 // Update in to the object with the modTime given of the given size
 //
 // When called from outside an Fs by rclone, src.Size() will always be >= 0.
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	if o.fs.opt.MultipartUpload {
+		return o._MultipartUpload(ctx, in, src, options...)
+	}
+
 	if src.Size() == 0 {
 		return fs.ErrorCantUploadEmptyFiles
 	}
