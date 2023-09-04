@@ -32,11 +32,15 @@ import (
 )
 
 const (
-	maxEntitiesPerPage = 64
-	minSleep           = 50 * time.Millisecond // Server sometimes reflects changes slowly
-	maxSleep           = 4 * time.Second
-	decayConstant      = 2
-	partSize int64     = 100 * 1024 * 1024 // 100MB * 1_000 (max #parts) = max 100GB single file
+	maxEntitiesPerPage        = 64
+	minSleep                  = 50 * time.Millisecond // Server sometimes reflects changes slowly
+	maxSleep                  = 4 * time.Second
+	decayConstant             = 2
+	defaultPartSize int64     = 250 * 1024 * 1024 // 250MB * 1_000 (max #parts supported by OBS)
+	                                              // implies max 250 GB max file size.
+										          // Use multipart_size configuration to override this.
+										          // Optionally use it along with chunker backend
+										          // to suppoer large file size with small part size.
 )
 
 func init() {
@@ -62,9 +66,9 @@ func init() {
 			Advanced: true,
 			Default: encoder.EncodeInvalidUtf8,
 		}, {
-			Name:     "multipart_upload",
-			Help: `If true use OBS multipart-upload mode wnere possible, else use default Linkbox API upload mode`,
-			Default:  true,
+			Name:     "multipart_size",
+			Help: `The part size for multipart upload. 0 to disable multipart upload`,
+			Default:  defaultPartSize,
 			Advanced: true,
 		}},
 	}
@@ -77,19 +81,20 @@ type Options struct {
 	Email string             `config:"email"`
 	Password string          `config:"password"`
 	Enc encoder.MultiEncoder `config:"encoding"`
-	MultipartUpload bool `config:"multipart_upload"`
+	MultipartSize int64      `config:"multipart_size"`
 }
 
 // Fs stores the interface to the remote Linkbox files
 type Fs struct {
-	name     string
-	root     string
-	opt      Options        // options for this backend
-	features *fs.Features   // optional features
-	ci       *fs.ConfigInfo // global config
-	srv      *rest.Client   // the connection to the server
-	pacer    *fs.Pacer      // pacer for API calls
-	accToken string         // account token
+	name       string
+	root       string
+	opt        Options        // options for this backend
+	features   *fs.Features   // optional features
+	ci         *fs.ConfigInfo // global config
+	httpClient *http.Client   // shared http client internally
+	srv        *rest.Client   // the connection to the server
+	pacer      *fs.Pacer      // pacer for API calls
+	accToken   string         // account token
 }
 
 // Object is a remote object that has been stat'd (so it exists, but is not necessarily open for reading)
@@ -119,12 +124,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	ci := fs.GetConfig(ctx)
 
+	httpClient_ := fshttp.NewClient(ctx)
 	f := &Fs{
 		name: name,
 		root: root,
 		opt:  *opt,
 		ci:   ci,
-		srv:   rest.NewClient(fshttp.NewClient(ctx)),
+		httpClient: httpClient_,
+		srv:   rest.NewClient(httpClient_),
 		pacer: fs.NewPacer(
 			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
 			pacer.MaxSleep(maxSleep),
@@ -137,7 +144,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Account token is the prerequisite for OBS multipart uploads
 	// If it is not available, fall back to the default API upload mode
 	if f.accToken == "" {
-		f.opt.MultipartUpload = false
+		f.opt.MultipartSize = 0
 	}
 
 	f.features = (&fs.Features{
@@ -1046,7 +1053,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return res.Body, nil
 }
 
-func UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64) error {
+func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64) error {
 	file, err := os.CreateTemp("", "linkbox_multipart_upload_*")
 	if err != nil {
 		return fmt.Errorf("failed to create multipart file: %w", err)
@@ -1070,6 +1077,7 @@ func UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64
 		metadata.Data.Sk,
 		metadata.Data.Server,
 		obs.WithSecurityToken(metadata.Data.SToken),
+		// obs.WithHttpClient(o.fs.httpClient),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create obs client: %w", err)
@@ -1083,6 +1091,7 @@ func UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
+	partSize := o.fs.opt.MultipartSize
 	partCount := int(inSize / partSize)
 	if inSize % partSize != 0 {
 		partCount++
@@ -1148,12 +1157,13 @@ func UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64
 	return nil
 }
 
-func UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
+func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
 	obsClient, err := obs.New(
 		metadata.Data.Ak,
 		metadata.Data.Sk,
 		metadata.Data.Server,
 		obs.WithSecurityToken(metadata.Data.SToken),
+		// obs.WithHttpClient(o.fs.httpClient),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create obs client: %w", err)
@@ -1236,10 +1246,10 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 	switch fileUploadSessionRes.Status {
 	case 1:
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
-		if src.Size() > partSize {
-			err = UploadParts(&file, &fileUploadSessionRes, src.Size())
+		if src.Size() > o.fs.opt.MultipartSize {
+			err = o.UploadParts(&file, &fileUploadSessionRes, src.Size())
 		} else {
-			err = UploadOnePart(&file, &fileUploadSessionRes)
+			err = o.UploadOnePart(&file, &fileUploadSessionRes)
 		}
 
 		if err != nil {
@@ -1327,7 +1337,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.fs.opt.MultipartUpload {
+	if o.fs.opt.MultipartSize > 0 {
 		return o._MultipartUpload(ctx, in, src, options...)
 	}
 
