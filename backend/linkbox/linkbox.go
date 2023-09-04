@@ -36,7 +36,7 @@ const (
 	minSleep           = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep           = 4 * time.Second
 	decayConstant      = 2
-	partSize int64     = 5 * 1024 * 1024
+	partSize int64     = 100 * 1024 * 1024 // 100MB * 1_000 (max #parts) = max 100GB single file
 )
 
 func init() {
