@@ -39,7 +39,7 @@ const (
 	maxPartSize               = 5 * 1_024 * 1_024 * 1_024 // Object Store Service - SDK developer guild
 	minPartSize               = 100 * 1024 // Object Store Service - SDK developer guild
 	maxPerUploadParts         = 10_000
-	defaultPerUploadParts     = 10
+	multipartConcurrency      = 10
 )
 
 func init() {
@@ -65,9 +65,9 @@ func init() {
 			Advanced:   true,
 			Default:    encoder.EncodeInvalidUtf8,
 		}, {
-			Name:       "multipart_per_upload_parts",
-			Help:       "The target number of parts for each multipart upload. 0 to disable.",
-			Default:    defaultPerUploadParts,
+			Name:       "multipart_concurrency",
+			Help:       "The target concurrency of multipart uploading. 0 to disable mulipart uploading.",
+			Default:    multipartConcurrency,
 			Advanced:   true,
 		}},
 	}
@@ -80,7 +80,7 @@ type Options struct {
 	Email string                 `config:"email"`
 	Password string              `config:"password"`
 	Enc encoder.MultiEncoder     `config:"encoding"`
-	MultipartPerUploadParts int  `config:"multipart_per_upload_parts"`
+	MultipartConcurrency int     `config:"multipart_concurrency"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -143,7 +143,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Account token is the prerequisite for OBS multipart uploads
 	// If it is not available, fall back to the default API upload mode
 	if f.accToken == "" {
-		f.opt.MultipartPerUploadParts = 0
+		f.opt.MultipartConcurrency = 0
 	}
 
 	f.features = (&fs.Features{
@@ -1052,10 +1052,61 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return res.Body, nil
 }
 
+func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
+	obsClient, err := obs.New(
+			metadata.Data.Ak,
+			metadata.Data.Sk,
+			metadata.Data.Server,
+			obs.WithSecurityToken(metadata.Data.SToken),
+			// obs.WithHttpClient(o.fs.httpClient),
+	)
+	if err != nil {
+			return fmt.Errorf("failed to create obs client: %w", err)
+	}
+
+	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
+	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
+	initiateMultipartUploadInput.Key = metadata.Data.PoolPath
+	initiateMultipartUploadOutput, err := obsClient.InitiateMultipartUpload(initiateMultipartUploadInput)
+	if err != nil {
+			return fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	uploadPartInput := &obs.UploadPartInput{}
+	uploadPartInput.Bucket = metadata.Data.Bucket
+	uploadPartInput.Key = metadata.Data.PoolPath
+	uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
+	uploadPartInput.PartNumber = 1
+	uploadPartInput.Body = *in
+	uploadPartOutput, err := obsClient.UploadPart(uploadPartInput)
+	if err != nil {
+			return fmt.Errorf("failed to upload part: %w", err)
+	}
+
+	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
+	completeMultipartUploadInput.Bucket = metadata.Data.Bucket
+	completeMultipartUploadInput.Key = metadata.Data.PoolPath
+	completeMultipartUploadInput.UploadId = initiateMultipartUploadOutput.UploadId
+	completeMultipartUploadInput.Parts = []obs.Part{
+			{PartNumber: uploadPartOutput.PartNumber, ETag: uploadPartOutput.ETag},
+	}
+	_, err = obsClient.CompleteMultipartUpload(completeMultipartUploadInput)
+	if err != nil {
+			return fmt.Errorf("failed to complete part: %w", err)
+	}
+
+	return nil
+}
+
 func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64, partSize int64) error {
 	partCount := int(inSize / partSize)
 	if inSize % partSize != 0 {
 		partCount++
+	}
+
+	// Reduce disk overhead by reading the single part from `in` instead of copying parts to temp file
+	if partCount == 1 {
+		return o.UploadOnePart(in, metadata)
 	}
 
 	if partCount > maxPerUploadParts {
@@ -1205,8 +1256,8 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 	case 1:
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
 
-		// calculate part size according to the target o.fs.opt.MultipartPerUploadParts
-		partSize := src.Size() / int64(o.fs.opt.MultipartPerUploadParts)
+		// calculate part size according to the target multipart concurrency
+		partSize := src.Size() / int64(o.fs.opt.MultipartConcurrency)
 		if partSize < minPartSize {
 			partSize = minPartSize
 		} else if partSize > maxPartSize {
@@ -1299,7 +1350,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.fs.opt.MultipartPerUploadParts > 0 {
+	if o.fs.opt.MultipartConcurrency > 0 {
 		return o._MultipartUpload(ctx, in, src, options...)
 	}
 
