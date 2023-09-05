@@ -36,40 +36,39 @@ const (
 	minSleep                  = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep                  = 4 * time.Second
 	decayConstant             = 2
-	defaultPartSize int64     = 250 * 1024 * 1024 // 250MB * 1_000 (max #parts supported by OBS)
-	                                              // implies max 250 GB max file size.
-										          // Use multipart_size configuration to override this.
-										          // Optionally use it along with chunker backend
-										          // to suppoer large file size with small part size.
+	maxPartSize               = 5 * 1_024 * 1_024 * 1_024 // Object Store Service - SDK developer guild
+	minPartSize               = 100 * 1024 // Object Store Service - SDK developer guild
+	maxPerUploadParts         = 10_000
+	defaultPerUploadParts     = 10
 )
 
 func init() {
 	fsi := &fs.RegInfo{
-		Name:        "linkbox",
-		Description: "Linkbox",
-		NewFs:       NewFs,
+		Name:           "linkbox",
+		Description:    "Linkbox",
+		NewFs:          NewFs,
 		Options: []fs.Option{{
-			Name:     "token",
-			Help:     "Token from https://www.linkbox.to/admin/account",
-			Required: true,
+			Name:       "token",
+			Help:       "Token from https://www.linkbox.to/admin/account",
+			Required:  true,
 		}, {
-			Name:      "email",
-			Help:      "The email for https://www.linkbox.to/api/user/login_email?email={email}",
+			Name:       "email",
+			Help:       "The email for https://www.linkbox.to/api/user/login_email?email={email}",
 			Sensitive: true,
 		}, {
 			Name:       "password",
 			Help:       "The password for https://www.linkbox.to/api/user/login_email?pwd={password}",
 			IsPassword: true,
 		}, {
-			Name:     config.ConfigEncoding,
-			Help:     config.ConfigEncodingHelp,
-			Advanced: true,
-			Default: encoder.EncodeInvalidUtf8,
+			Name:       config.ConfigEncoding,
+			Help:       config.ConfigEncodingHelp,
+			Advanced:   true,
+			Default:    encoder.EncodeInvalidUtf8,
 		}, {
-			Name:     "multipart_size",
-			Help: `The part size for multipart upload. 0 to disable multipart upload`,
-			Default:  defaultPartSize,
-			Advanced: true,
+			Name:       "multipart_per_upload_parts",
+			Help:       "The target number of parts for each multipart upload. 0 to disable.",
+			Default:    defaultPerUploadParts,
+			Advanced:   true,
 		}},
 	}
 	fs.Register(fsi)
@@ -77,11 +76,11 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Token string             `config:"token"`
-	Email string             `config:"email"`
-	Password string          `config:"password"`
-	Enc encoder.MultiEncoder `config:"encoding"`
-	MultipartSize int64      `config:"multipart_size"`
+	Token string                 `config:"token"`
+	Email string                 `config:"email"`
+	Password string              `config:"password"`
+	Enc encoder.MultiEncoder     `config:"encoding"`
+	MultipartPerUploadParts int  `config:"multipart_per_upload_parts"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -144,7 +143,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Account token is the prerequisite for OBS multipart uploads
 	// If it is not available, fall back to the default API upload mode
 	if f.accToken == "" {
-		f.opt.MultipartSize = 0
+		f.opt.MultipartPerUploadParts = 0
 	}
 
 	f.features = (&fs.Features{
@@ -1053,7 +1052,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return res.Body, nil
 }
 
-func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64) error {
+func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64, partSize int64) error {
+	partCount := int(inSize / partSize)
+	if inSize % partSize != 0 {
+		partCount++
+	}
+
+	if partCount > maxPerUploadParts {
+		return fmt.Errorf("too many parts: %d > %d", partCount, maxPerUploadParts)
+	}
+
 	file, err := os.CreateTemp("", "linkbox_multipart_upload_*")
 	if err != nil {
 		return fmt.Errorf("failed to create multipart file: %w", err)
@@ -1082,6 +1090,7 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 	if err != nil {
 		return fmt.Errorf("failed to create obs client: %w", err)
 	}
+	defer obsClient.Close()
 
 	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
 	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
@@ -1091,11 +1100,6 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
-	partSize := o.fs.opt.MultipartSize
-	partCount := int(inSize / partSize)
-	if inSize % partSize != 0 {
-		partCount++
-	}
 	partChan := make(chan obs.Part, 5)
 
 	for i := 0; i < partCount; i++ {
@@ -1157,52 +1161,6 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 	return nil
 }
 
-func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
-	obsClient, err := obs.New(
-		metadata.Data.Ak,
-		metadata.Data.Sk,
-		metadata.Data.Server,
-		obs.WithSecurityToken(metadata.Data.SToken),
-		// obs.WithHttpClient(o.fs.httpClient),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create obs client: %w", err)
-	}
-
-	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
-	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
-	initiateMultipartUploadInput.Key = metadata.Data.PoolPath
-	initiateMultipartUploadOutput, err := obsClient.InitiateMultipartUpload(initiateMultipartUploadInput)
-	if err != nil {
-		return fmt.Errorf("failed to initiate multipart upload: %w", err)
-	}
-
-	uploadPartInput := &obs.UploadPartInput{}
-	uploadPartInput.Bucket = metadata.Data.Bucket
-	uploadPartInput.Key = metadata.Data.PoolPath
-	uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
-	uploadPartInput.PartNumber = 1
-	uploadPartInput.Body = *in
-	uploadPartOutput, err := obsClient.UploadPart(uploadPartInput)
-	if err != nil {
-		return fmt.Errorf("failed to upload part: %w", err)
-	}
-
-	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
-	completeMultipartUploadInput.Bucket = metadata.Data.Bucket
-	completeMultipartUploadInput.Key = metadata.Data.PoolPath
-	completeMultipartUploadInput.UploadId = initiateMultipartUploadOutput.UploadId
-	completeMultipartUploadInput.Parts = []obs.Part{
-		{PartNumber: uploadPartOutput.PartNumber, ETag: uploadPartOutput.ETag},
-	}
-	_, err = obsClient.CompleteMultipartUpload(completeMultipartUploadInput)
-	if err != nil {
-		return fmt.Errorf("failed to complete part: %w", err)
-	}
-
-	return nil
-}
-
 func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	if src.Size() == 0 {
 		return fs.ErrorCantUploadEmptyFiles
@@ -1246,12 +1204,16 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 	switch fileUploadSessionRes.Status {
 	case 1:
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
-		if src.Size() > o.fs.opt.MultipartSize {
-			err = o.UploadParts(&file, &fileUploadSessionRes, src.Size())
-		} else {
-			err = o.UploadOnePart(&file, &fileUploadSessionRes)
+
+		// calculate part size according to the target o.fs.opt.MultipartPerUploadParts
+		partSize := src.Size() / int64(o.fs.opt.MultipartPerUploadParts)
+		if partSize < minPartSize {
+			partSize = minPartSize
+		} else if partSize > maxPartSize {
+			partSize = maxPartSize
 		}
 
+		err = o.UploadParts(&file, &fileUploadSessionRes, src.Size(), partSize)
 		if err != nil {
 			return err
 		}
@@ -1337,7 +1299,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.fs.opt.MultipartSize > 0 {
+	if o.fs.opt.MultipartPerUploadParts > 0 {
 		return o._MultipartUpload(ctx, in, src, options...)
 	}
 
