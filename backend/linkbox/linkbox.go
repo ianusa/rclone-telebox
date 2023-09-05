@@ -36,10 +36,13 @@ const (
 	minSleep                  = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep                  = 4 * time.Second
 	decayConstant             = 2
-	maxPartSize               = 5 * 1_024 * 1_024 * 1_024 // Object Store Service - SDK developer guild
-	minPartSize               = 100 * 1024 // Object Store Service - SDK developer guild
+	responseHeaderTimeoutSec  = 300
+	maxPartSize               = 500 * 1_024 * 1_024 // SDK developer guide: max 5 GB
+	                                                // That said 500 MB is prefered to lower probability of response timeout
+	minPartSize               = 5 * 1024 * 1024 // SDK developer guide: min 100 KB
+	                                            // That said 5MB is preferred aligned with SDK default part size
 	maxPerUploadParts         = 10_000
-	multipartConcurrency      = 10
+	multipartConcurrency      = 12
 )
 
 func init() {
@@ -66,8 +69,13 @@ func init() {
 			Default:    encoder.EncodeInvalidUtf8,
 		}, {
 			Name:       "multipart_concurrency",
-			Help:       "The target concurrency of multipart uploading. 0 to disable mulipart uploading.",
+			Help:       "The target concurrency of multipart uploading. 0 to disable mulipart uploading",
 			Default:    multipartConcurrency,
+			Advanced:   true,
+		}, {
+			Name:       "multipart_response_timeout",
+			Help:       "The response timeout of uploading parts in seconds",
+			Default:    responseHeaderTimeoutSec,
 			Advanced:   true,
 		}},
 	}
@@ -81,6 +89,7 @@ type Options struct {
 	Password string              `config:"password"`
 	Enc encoder.MultiEncoder     `config:"encoding"`
 	MultipartConcurrency int     `config:"multipart_concurrency"`
+	MultipartResponseTimeout int `config:"multipart_response_timeout"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -1058,6 +1067,7 @@ func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes
 			metadata.Data.Sk,
 			metadata.Data.Server,
 			obs.WithSecurityToken(metadata.Data.SToken),
+			obs.WithHeaderTimeout(o.fs.opt.MultipartResponseTimeout),
 			// obs.WithHttpClient(o.fs.httpClient),
 	)
 	if err != nil {
@@ -1136,6 +1146,7 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		metadata.Data.Sk,
 		metadata.Data.Server,
 		obs.WithSecurityToken(metadata.Data.SToken),
+		obs.WithHeaderTimeout(o.fs.opt.MultipartResponseTimeout),
 		// obs.WithHttpClient(o.fs.httpClient),
 	)
 	if err != nil {
