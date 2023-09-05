@@ -1053,6 +1053,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64, partSize int64) error {
+	partCount := int(inSize / partSize)
+	if inSize % partSize != 0 {
+		partCount++
+	}
+
+	if partCount > maxPerUploadParts {
+		return fmt.Errorf("too many parts: %d > %d", partCount, maxPerUploadParts)
+	}
+
 	file, err := os.CreateTemp("", "linkbox_multipart_upload_*")
 	if err != nil {
 		return fmt.Errorf("failed to create multipart file: %w", err)
@@ -1091,10 +1100,6 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
-	partCount := int(inSize / partSize)
-	if inSize % partSize != 0 {
-		partCount++
-	}
 	partChan := make(chan obs.Part, 5)
 
 	for i := 0; i < partCount; i++ {
