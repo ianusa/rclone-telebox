@@ -15,6 +15,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/juicedata/huaweicloud-sdk-go-obs/obs"
@@ -24,25 +25,29 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"storj.io/common/readcloser"
 )
 
 const (
-	maxEntitiesPerPage        = 64
-	minSleep                  = 50 * time.Millisecond // Server sometimes reflects changes slowly
-	maxSleep                  = 4 * time.Second
-	decayConstant             = 2
-	responseHeaderTimeoutSec  = 300
-	maxPartSize               = 500 * 1_024 * 1_024 // SDK developer guide: max 5 GB
-	                                                // That said 500 MB is prefered to lower probability of response timeout
-	minPartSize               = 5 * 1024 * 1024 // SDK developer guide: min 100 KB
-	                                            // That said 5MB is preferred aligned with SDK default part size
-	maxPerUploadParts         = 10_000
-	multipartConcurrency      = 12
+	maxEntitiesPerPage                 = 64
+	minSleep                           = 50 * time.Millisecond // Server sometimes reflects changes slowly
+	maxSleep                           = 4 * time.Second
+	decayConstant                      = 2
+	multipartResponseHeaderTimeoutSec  = 300
+	maxPartSize                        = 500 * 1_024 * 1_024 // SDK developer guide: max 5 GB
+	                                                         // That said 500 MB is prefered to lower probability of response timeout
+	minPartSize                        = 5 * 1_024 * 1_024 // SDK developer guide: min 100 KB
+	                                                       // That said 5MB is preferred aligned with SDK default part size
+	maxPerUploadParts                  = 10_000
+	multipartTxConcurrency             = 12
+	multipartRxConcurrency             = 16
+	minDownloadPartSize                = 1 * 1_024 * 1_024
 )
 
 func init() {
@@ -68,14 +73,19 @@ func init() {
 			Advanced:   true,
 			Default:    encoder.EncodeInvalidUtf8,
 		}, {
-			Name:       "multipart_concurrency",
-			Help:       "The target concurrency of multipart uploading. 0 to disable mulipart uploading",
-			Default:    multipartConcurrency,
+			Name:       "multipart_tx_concurrency",
+			Help:       "The target concurrency of multipart uploading. 0 to disable",
+			Default:    multipartTxConcurrency,
 			Advanced:   true,
 		}, {
-			Name:       "multipart_response_timeout",
-			Help:       "The response timeout of uploading parts in seconds",
-			Default:    responseHeaderTimeoutSec,
+			Name:       "multipart_rx_concurrency",
+			Help:       "The target concurrency of multipart donwloading. 0 to disable",
+			Default:    multipartRxConcurrency,
+			Advanced:   true,
+		}, {
+			Name:       "multipart_response_header_timeout",
+			Help:       "The timeout of waiting for response header of uploading parts",
+			Default:    multipartResponseHeaderTimeoutSec,
 			Advanced:   true,
 		}},
 	}
@@ -84,12 +94,13 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	Token string                 `config:"token"`
-	Email string                 `config:"email"`
-	Password string              `config:"password"`
-	Enc encoder.MultiEncoder     `config:"encoding"`
-	MultipartConcurrency int     `config:"multipart_concurrency"`
-	MultipartResponseTimeout int `config:"multipart_response_timeout"`
+	Token string                       `config:"token"`
+	Email string                       `config:"email"`
+	Password string                    `config:"password"`
+	Enc encoder.MultiEncoder           `config:"encoding"`
+	MultipartTxConcurrency int         `config:"multipart_tx_concurrency"`
+	MultipartRxConcurrency int         `config:"multipart_rx_concurrency"`
+	MultipartResponseHeaderTimeout int `config:"multipart_response_header_timeout"`
 }
 
 // Fs stores the interface to the remote Linkbox files
@@ -99,7 +110,7 @@ type Fs struct {
 	opt        Options        // options for this backend
 	features   *fs.Features   // optional features
 	ci         *fs.ConfigInfo // global config
-	httpClient *http.Client   // shared http client internally
+	downloader *http.Client   // multi-threaded downloader
 	srv        *rest.Client   // the connection to the server
 	pacer      *fs.Pacer      // pacer for API calls
 	accToken   string         // account token
@@ -131,15 +142,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	ci := fs.GetConfig(ctx)
-
-	httpClient_ := fshttp.NewClient(ctx)
 	f := &Fs{
 		name: name,
 		root: root,
 		opt:  *opt,
 		ci:   ci,
-		httpClient: httpClient_,
-		srv:   rest.NewClient(httpClient_),
+		downloader: fshttp.NewClient(ctx),
+		srv:   rest.NewClient(fshttp.NewClient(ctx)),
 		pacer: fs.NewPacer(
 			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
 			pacer.MaxSleep(maxSleep),
@@ -152,7 +161,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Account token is the prerequisite for OBS multipart uploads
 	// If it is not available, fall back to the default API upload mode
 	if f.accToken == "" {
-		f.opt.MultipartConcurrency = 0
+		f.opt.MultipartTxConcurrency = 0
 	}
 
 	f.features = (&fs.Features{
@@ -240,17 +249,17 @@ func getIdByDir(f *Fs, ctx context.Context, dir string) (int, error) {
 	return pid, nil
 }
 
-func (f *Fs) _FetchDataWithRetries(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
+func (f *Fs) _FetchWithRetries(ctx context.Context, opts *rest.Opts) (resp *http.Response, err error) {
 	f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, opts)
-		return err != nil, fmt.Errorf("failed to fetch data, err: %w", err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 
     return
 }
 
 func (f *Fs) _GetUnmarshaledResponse(ctx context.Context, opts *rest.Opts, result interface{}) error {
-	res, err := f._FetchDataWithRetries(ctx, opts)
+	res, err := f._FetchWithRetries(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -1030,6 +1039,58 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f._MoveFile(ctx, srcObj, remote)
 }
 
+// retryErrorCodes is a slice of error codes that we will retry
+var retryErrorCodes = []int{
+	400, // Bad request (seen in "Next token is expired")
+	401, // Unauthorized (seen in "Token has expired")
+	408, // Request Timeout
+	429, // Rate exceeded.
+	500, // Get occasional 500 Internal Server Error
+	502, // Bad Gateway when doing big listings
+	503, // Service Unavailable
+	504, // Gateway Time-out
+}
+
+// shouldRetry returns a boolean as to whether this resp and err
+// deserve to be retried.  It returns the err as a convenience
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+func (o *Object) DownloadRange(ctx context.Context, id int, url string, start, end int64, options ...fs.OpenOption) (io.ReadCloser, error) {
+	var opts rest.Opts
+	var res *http.Response
+	var err error
+	if start == end {
+		opts = rest.Opts{
+			Method:  "GET",
+			RootURL: url,
+			Options: options,
+		}
+		res, err = o.fs._FetchWithRetries(ctx, &opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download %s: %w", url, err)
+		}
+	} else {
+		o.fs.pacer.Call(func() (bool, error) {
+			// Use REST Call api would hit the panic:
+			// multi-thread copy: failed to write chunk N: wrote X bytes but expected to write Y
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			res, err = o.fs.downloader.Do(req)
+			return o.fs.shouldRetry(ctx, res, fmt.Errorf("%d: failed to download part(%d-%d) of %s: %w", id, start, end, url, err))
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return res.Body, nil
+}
+
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	downloadURL := o.fullURL
@@ -1047,18 +1108,84 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	fs.FixRangeOption(options, o.size)
-	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: downloadURL,
-		Options: options,
+
+	if o.fs.opt.MultipartRxConcurrency == 0 {
+		return o.DownloadRange(ctx, 0, downloadURL, 0, 0, options...)
 	}
 
-	res, err := o.fs._FetchDataWithRetries(ctx, &opts)
-	if err != nil {
-		return nil, fmt.Errorf("Open failed: %w", err)
+	// Check if there is one single range option after FixRangeOption
+	start, end := int64(0), int64(0)
+	numRangeOptions := 0
+	for i := range options {
+		if rangeOption, ok := options[i].(*fs.RangeOption); ok {
+			numRangeOptions++
+			if rangeOption.Start >= 0 && rangeOption.Start < rangeOption.End {
+				start = rangeOption.Start
+				end = rangeOption.End
+			}
+		}
 	}
 
-	return res.Body, nil
+	// Don't support no/multiple range options
+	if numRangeOptions != 1 {
+		return o.DownloadRange(ctx, 0, downloadURL, 0, 0, options...)
+	}
+
+	length := end - start + 1
+	threads := o.fs.opt.MultipartRxConcurrency
+	partSize := length / int64(threads)
+	remainder := length % int64(threads)
+	if remainder != 0 {
+		threads++
+	}
+
+	// There is no need for multi-threaded download
+	if threads == 1 {
+		return o.DownloadRange(ctx, 0, downloadURL, start, end, options...)
+	}
+
+	// Too small size to fit multi-threaded download
+	if partSize < minDownloadPartSize {
+		return o.DownloadRange(ctx, 0, downloadURL, 0, 0, options...)
+	}
+
+	// Multi-threaded download
+	wg := &sync.WaitGroup{}
+	parts := make([]io.ReadCloser, threads)
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		start_ := start + int64(i) * partSize
+		end_ := start + int64(i + 1) * partSize - 1
+
+		if i == (threads - 1) && remainder > 0 {
+			end_ = start_ + remainder - 1
+		}
+
+		go func(start, end int64, partLoc *io.ReadCloser, id int) {
+			*partLoc, _ = o.DownloadRange(ctx, id, downloadURL, start, end, options...)
+			wg.Done()
+		}(start_, end_, &parts[i], i)
+	}
+	wg.Wait()
+
+	successfulParts := make([]io.ReadCloser, 0)
+	numSuccessfulParts := 0
+	for i := range parts {
+		if parts[i] != nil {
+			numSuccessfulParts++
+			successfulParts = append(successfulParts, parts[i])
+		}
+	}
+
+	if numSuccessfulParts != threads {
+		// Ensure downloaded parts being closed to release resources
+		for i := range successfulParts {
+			successfulParts[i].Close()
+		}
+		return nil, fmt.Errorf("failed to download %d parts for %s", threads - numSuccessfulParts, downloadURL)
+	}
+
+	return readcloser.MultiReadCloser(parts...), nil
 }
 
 func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
@@ -1067,8 +1194,7 @@ func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes
 			metadata.Data.Sk,
 			metadata.Data.Server,
 			obs.WithSecurityToken(metadata.Data.SToken),
-			obs.WithHeaderTimeout(o.fs.opt.MultipartResponseTimeout),
-			// obs.WithHttpClient(o.fs.httpClient),
+			obs.WithHeaderTimeout(o.fs.opt.MultipartResponseHeaderTimeout),
 	)
 	if err != nil {
 			return fmt.Errorf("failed to create obs client: %w", err)
@@ -1146,8 +1272,7 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		metadata.Data.Sk,
 		metadata.Data.Server,
 		obs.WithSecurityToken(metadata.Data.SToken),
-		obs.WithHeaderTimeout(o.fs.opt.MultipartResponseTimeout),
-		// obs.WithHttpClient(o.fs.httpClient),
+		obs.WithHeaderTimeout(o.fs.opt.MultipartResponseHeaderTimeout),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create obs client: %w", err)
@@ -1268,7 +1393,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
 
 		// calculate part size according to the target multipart concurrency
-		partSize := src.Size() / int64(o.fs.opt.MultipartConcurrency)
+		partSize := src.Size() / int64(o.fs.opt.MultipartTxConcurrency)
 		if partSize < minPartSize {
 			partSize = minPartSize
 		} else if partSize > maxPartSize {
@@ -1361,7 +1486,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.fs.opt.MultipartConcurrency > 0 {
+	if o.fs.opt.MultipartTxConcurrency > 0 {
 		return o._MultipartUpload(ctx, in, src, options...)
 	}
 
@@ -1412,7 +1537,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 			Body:    file,
 		}
 
-		res, err := o.fs._FetchDataWithRetries(ctx, &opts)
+		res, err := o.fs._FetchWithRetries(ctx, &opts)
 		if err != nil {
 			return err
 		}
