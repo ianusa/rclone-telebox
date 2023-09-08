@@ -45,7 +45,7 @@ const (
 	minPartSize                        = 5 * 1_024 * 1_024 // SDK developer guide: min 100 KB
 	                                                       // That said 5MB is preferred aligned with SDK default part size
 	maxPerUploadParts                  = 10_000
-	multipartTxConcurrency             = 12
+	multipartTxConcurrency             = 16
 	multipartRxConcurrency             = 16
 	minDownloadPartSize                = 1 * 1_024 * 1_024
 )
