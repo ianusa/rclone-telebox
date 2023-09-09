@@ -110,7 +110,7 @@ type Fs struct {
 	opt        Options        // options for this backend
 	features   *fs.Features   // optional features
 	ci         *fs.ConfigInfo // global config
-	downloader *http.Client   // multi-threaded downloader
+	downloader *http.Client   // multipart downloader
 	srv        *rest.Client   // the connection to the server
 	pacer      *fs.Pacer      // pacer for API calls
 	accToken   string         // account token
@@ -1132,32 +1132,32 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	length := end - start + 1
-	threads := o.fs.opt.MultipartRxConcurrency
-	partSize := length / int64(threads)
-	remainder := length % int64(threads)
+	concurrency := o.fs.opt.MultipartRxConcurrency
+	partSize := length / int64(concurrency)
+	remainder := length % int64(concurrency)
 	if remainder != 0 {
-		threads++
+		concurrency++
 	}
 
-	// There is no need for multi-threaded download
-	if threads == 1 {
+	// There is no need for multipart download
+	if concurrency == 1 {
 		return o.DownloadRange(ctx, 0, downloadURL, start, end, options...)
 	}
 
-	// Too small size to fit multi-threaded download
+	// Too small size to fit multipart download
 	if partSize < minDownloadPartSize {
 		return o.DownloadRange(ctx, 0, downloadURL, 0, 0, options...)
 	}
 
-	// Multi-threaded download
+	// Multipart download
 	wg := &sync.WaitGroup{}
-	parts := make([]io.ReadCloser, threads)
-	for i := 0; i < threads; i++ {
+	parts := make([]io.ReadCloser, concurrency)
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		start_ := start + int64(i) * partSize
 		end_ := start + int64(i + 1) * partSize - 1
 
-		if i == (threads - 1) && remainder > 0 {
+		if i == (concurrency - 1) && remainder > 0 {
 			end_ = start_ + remainder - 1
 		}
 
@@ -1177,12 +1177,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	if numSuccessfulParts != threads {
+	if numSuccessfulParts != concurrency {
 		// Ensure downloaded parts being closed to release resources
 		for i := range successfulParts {
 			successfulParts[i].Close()
 		}
-		return nil, fmt.Errorf("failed to download %d parts for %s", threads - numSuccessfulParts, downloadURL)
+		return nil, fmt.Errorf("failed to download %d parts for %s", concurrency - numSuccessfulParts, downloadURL)
 	}
 
 	return readcloser.MultiReadCloser(parts...), nil
@@ -1287,7 +1287,7 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
-	partChan := make(chan obs.Part, 5)
+	partChan := make(chan obs.Part)
 
 	for i := 0; i < partCount; i++ {
 		partNumber := i + 1
@@ -1306,7 +1306,7 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 			uploadPartInput.Offset = offset
 			uploadPartInput.PartSize = partSize
 			uploadPartInputOutput, err := obsClient.UploadPart(uploadPartInput)
-			if err == nil {
+			if err == nil && uploadPartInputOutput.PartNumber == index {
 				partChan <- obs.Part{ETag: uploadPartInputOutput.ETag, PartNumber: uploadPartInputOutput.PartNumber}
 			} else {
 				partChan <- obs.Part{ETag: "", PartNumber: -1}
