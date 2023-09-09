@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -39,15 +38,16 @@ const (
 	minSleep                           = 50 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep                           = 4 * time.Second
 	decayConstant                      = 2
-	multipartResponseHeaderTimeoutSec  = 300
-	maxPartSize                        = 500 * 1_024 * 1_024 // SDK developer guide: max 5 GB
-	                                                         // That said 500 MB is prefered to lower probability of response timeout
-	minPartSize                        = 5 * 1_024 * 1_024 // SDK developer guide: min 100 KB
-	                                                       // That said 5MB is preferred aligned with SDK default part size
+	multipartResponseHeaderTimeoutSec  = 90
+	maxPartSize                        = 5 * 1_024 * 1_024 * 1_024 // SDK developer guide: max 5 GB
+	minPartSize                        = 100 * 1_024 // SDK developer guide: min 100 KB
+	defaultPartSize                    = 6 * 1_024 * 1_024
 	maxPerUploadParts                  = 10_000
+	multipartMaxBufferSize             = 100 * 1024 * 1024
 	multipartTxConcurrency             = 16
 	multipartRxConcurrency             = 16
 	minDownloadPartSize                = 1 * 1_024 * 1_024
+	maxTxRxRetries                     = 3
 )
 
 func init() {
@@ -78,6 +78,16 @@ func init() {
 			Default:    multipartTxConcurrency,
 			Advanced:   true,
 		}, {
+			Name:       "multipart_tx_part_size",
+			Help:       "The part size of multipart uploading",
+			Default:    defaultPartSize,
+			Advanced:   true,
+		}, {
+			Name:       "multipart_tx_max_buffer_size",
+			Help:       "The max buffer size of multipart uploading. Buffer is per transfer determined by rclone --transfers",
+			Default:    multipartMaxBufferSize,
+			Advanced:   true,
+		}, {
 			Name:       "multipart_rx_concurrency",
 			Help:       "The target concurrency of multipart donwloading. 0 to disable",
 			Default:    multipartRxConcurrency,
@@ -99,6 +109,8 @@ type Options struct {
 	Password string                    `config:"password"`
 	Enc encoder.MultiEncoder           `config:"encoding"`
 	MultipartTxConcurrency int         `config:"multipart_tx_concurrency"`
+	MultipartTxPartSize   int64        `config:"multipart_tx_part_size"`
+	MultipartTxMaxBufferSize int64     `config:"multipart_tx_max_buffer_size"`
 	MultipartRxConcurrency int         `config:"multipart_rx_concurrency"`
 	MultipartResponseHeaderTimeout int `config:"multipart_response_header_timeout"`
 }
@@ -113,6 +125,8 @@ type Fs struct {
 	downloader *http.Client   // multipart downloader
 	srv        *rest.Client   // the connection to the server
 	pacer      *fs.Pacer      // pacer for API calls
+	txPacers   []*fs.Pacer    // pacers for multipart uploads
+	rxPacers   []*fs.Pacer    // pacers for multipart downloads
 	accToken   string         // account token
 }
 
@@ -153,7 +167,23 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
 			pacer.MaxSleep(maxSleep),
 			pacer.DecayConstant(decayConstant))),
+		txPacers: make([]*fs.Pacer, 0),
+		rxPacers: make([]*fs.Pacer, 0),
 		accToken: "",
+	}
+
+	for i := 0; i < f.opt.MultipartTxConcurrency; i++ {
+		f.txPacers = append(f.txPacers, fs.NewPacer(
+			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
+			pacer.MaxSleep(maxSleep),
+			pacer.DecayConstant(decayConstant))))
+	}
+
+	for i := 0; i < f.opt.MultipartRxConcurrency; i++ {
+		f.rxPacers = append(f.rxPacers, fs.NewPacer(
+			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
+			pacer.MaxSleep(maxSleep),
+			pacer.DecayConstant(decayConstant))))
 	}
 
 	f._UpdateAccountToken(ctx)
@@ -1075,13 +1105,14 @@ func (o *Object) DownloadRange(ctx context.Context, id int, url string, start, e
 			return nil, fmt.Errorf("failed to download %s: %w", url, err)
 		}
 	} else {
-		o.fs.pacer.Call(func() (bool, error) {
-			// Use REST Call api would hit the panic:
+		pacer := o.fs.rxPacers[id % len(o.fs.rxPacers)]
+		pacer.Call(func() (bool, error) {
+			// Use REST Call api would invalidate multipart downloads and somehow hit the panic:
 			// multi-thread copy: failed to write chunk N: wrote X bytes but expected to write Y
 			req, _ := http.NewRequest("GET", url, nil)
 			req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 			res, err = o.fs.downloader.Do(req)
-			return o.fs.shouldRetry(ctx, res, fmt.Errorf("%d: failed to download part(%d-%d) of %s: %w", id, start, end, url, err))
+			return o.fs.shouldRetry(ctx, res, err)
 		})
 		if err != nil {
 			return nil, err
@@ -1188,83 +1219,24 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	return readcloser.MultiReadCloser(parts...), nil
 }
 
-func (o *Object) UploadOnePart(in *io.Reader, metadata *api.FileUploadSessionRes) error {
-	obsClient, err := obs.New(
-			metadata.Data.Ak,
-			metadata.Data.Sk,
-			metadata.Data.Server,
-			obs.WithSecurityToken(metadata.Data.SToken),
-			obs.WithHeaderTimeout(o.fs.opt.MultipartResponseHeaderTimeout),
-	)
-	if err != nil {
-			return fmt.Errorf("failed to create obs client: %w", err)
-	}
-
-	initiateMultipartUploadInput := &obs.InitiateMultipartUploadInput{}
-	initiateMultipartUploadInput.Bucket = metadata.Data.Bucket
-	initiateMultipartUploadInput.Key = metadata.Data.PoolPath
-	initiateMultipartUploadOutput, err := obsClient.InitiateMultipartUpload(initiateMultipartUploadInput)
-	if err != nil {
-			return fmt.Errorf("failed to initiate multipart upload: %w", err)
-	}
-
-	uploadPartInput := &obs.UploadPartInput{}
-	uploadPartInput.Bucket = metadata.Data.Bucket
-	uploadPartInput.Key = metadata.Data.PoolPath
-	uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
-	uploadPartInput.PartNumber = 1
-	uploadPartInput.Body = *in
-	uploadPartOutput, err := obsClient.UploadPart(uploadPartInput)
-	if err != nil {
-			return fmt.Errorf("failed to upload part: %w", err)
-	}
-
-	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
-	completeMultipartUploadInput.Bucket = metadata.Data.Bucket
-	completeMultipartUploadInput.Key = metadata.Data.PoolPath
-	completeMultipartUploadInput.UploadId = initiateMultipartUploadOutput.UploadId
-	completeMultipartUploadInput.Parts = []obs.Part{
-			{PartNumber: uploadPartOutput.PartNumber, ETag: uploadPartOutput.ETag},
-	}
-	_, err = obsClient.CompleteMultipartUpload(completeMultipartUploadInput)
-	if err != nil {
-			return fmt.Errorf("failed to complete part: %w", err)
-	}
-
-	return nil
-}
-
 func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, inSize int64, partSize int64) error {
+	// Calibrate concurrency as needed by the memory constraint
+	calibratedConcurrency := o.fs.opt.MultipartTxConcurrency
+	estimatedBufferSize := partSize * int64(calibratedConcurrency)
+	if estimatedBufferSize > o.fs.opt.MultipartTxMaxBufferSize {
+		calibratedConcurrency = int(o.fs.opt.MultipartTxMaxBufferSize / partSize)
+	}
+	if calibratedConcurrency < 1 {
+		calibratedConcurrency = 1
+	}
+
 	partCount := int(inSize / partSize)
 	if inSize % partSize != 0 {
 		partCount++
 	}
 
-	// Reduce disk overhead by reading the single part from `in` instead of copying parts to temp file
-	if partCount == 1 {
-		return o.UploadOnePart(in, metadata)
-	}
-
 	if partCount > maxPerUploadParts {
 		return fmt.Errorf("too many parts: %d > %d", partCount, maxPerUploadParts)
-	}
-
-	file, err := os.CreateTemp("", "linkbox_multipart_upload_*")
-	if err != nil {
-		return fmt.Errorf("failed to create multipart file: %w", err)
-	}
-
-	defer func(fd *os.File) {
-		for _, err := range [...]error{fd.Close(), os.Remove(fd.Name())} {
-			if err != nil {
-				log.Default().Printf("failed to remove multipart file(%s): %s", file.Name(), err)
-			}
-		}
-	}(file)
-
-	_, err = io.Copy(file, *in)
-	if err != nil {
-		return fmt.Errorf("failed to copy data to temp file(%s): %w", file.Name(), err)
 	}
 
 	obsClient, err := obs.New(
@@ -1287,52 +1259,81 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
 	}
 
-	partChan := make(chan obs.Part)
-
-	for i := 0; i < partCount; i++ {
-		partNumber := i + 1
-		offset := int64(i) * partSize
-		currPartSize := partSize
-		if i+1 == partCount {
-			currPartSize = inSize - offset
+	parts := make([]obs.Part, partCount)
+	wg := &sync.WaitGroup{}
+	tickets := make(chan struct{}, calibratedConcurrency)
+	GetTicket := func() {
+		tickets <- struct{}{}
+		wg.Add(1)
+	}
+	ReleaseTicket := func() {
+		<- tickets
+		wg.Done()
+	}
+	WaitForAllTcketsDone := func() {
+		wg.Wait()
+	}
+	hasFailures := false
+	for i := 0; i < partCount && !hasFailures; i += calibratedConcurrency {
+		concurrency := calibratedConcurrency
+		if i + concurrency > partCount {
+			concurrency = partCount - i
 		}
-		go func(index int, offset, partSize int64) {
-			uploadPartInput := &obs.UploadPartInput{}
-			uploadPartInput.Bucket = metadata.Data.Bucket
-			uploadPartInput.Key = metadata.Data.PoolPath
-			uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
-			uploadPartInput.SourceFile = file.Name()
-			uploadPartInput.PartNumber = index
-			uploadPartInput.Offset = offset
-			uploadPartInput.PartSize = partSize
-			uploadPartInputOutput, err := obsClient.UploadPart(uploadPartInput)
-			if err == nil && uploadPartInputOutput.PartNumber == index {
-				partChan <- obs.Part{ETag: uploadPartInputOutput.ETag, PartNumber: uploadPartInputOutput.PartNumber}
-			} else {
-				partChan <- obs.Part{ETag: "", PartNumber: -1}
+		for j := i; j < i + concurrency && !hasFailures; j++ {
+			GetTicket()
+			partNumber := j + 1
+			partReader := io.LimitReader(*in, partSize)
+			partContent, err := io.ReadAll(partReader)
+			if err != nil {
+				hasFailures = true
+				ReleaseTicket()
+				parts[partNumber - 1] = obs.Part{ETag: "", PartNumber: -1}
+				log.Default().Printf("failed to prepare part %d: %v", partNumber, err)
+				break
 			}
-		}(partNumber, offset, currPartSize)
+			body := bytes.NewReader(partContent)
+
+			go func(partNumber int, body *bytes.Reader) {
+				defer ReleaseTicket()
+
+				h := md5.New()
+				_, err := io.Copy(h, body)
+				if err != nil {
+					hasFailures = true
+					log.Default().Printf("failed to hash part %d: %v", partNumber, err)
+					return
+				}
+
+				uploadPartInput := &obs.UploadPartInput{}
+				uploadPartInput.Bucket = metadata.Data.Bucket
+				uploadPartInput.Key = metadata.Data.PoolPath
+				uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
+				uploadPartInput.ContentMD5 = obs.Base64Encode(h.Sum(nil))
+				uploadPartInput.PartNumber = partNumber
+
+				var uploadPartInputOutput *obs.UploadPartOutput
+				pacer := o.fs.txPacers[partNumber % len(o.fs.txPacers)]
+				pacer.Call(func() (bool, error) {
+					body.Seek(0, io.SeekStart)
+					uploadPartInput.Body = body
+					uploadPartInputOutput, err = obsClient.UploadPart(uploadPartInput)
+					return err != nil, err
+				})
+
+				if err == nil {
+					parts[partNumber - 1] = obs.Part{ETag: uploadPartInputOutput.ETag, PartNumber: uploadPartInputOutput.PartNumber}
+				} else {
+					parts[partNumber - 1] = obs.Part{ETag: "", PartNumber: -1}
+					log.Default().Printf("failed to upload part %d: %v", partNumber, err)
+					hasFailures = true
+				}
+			}(partNumber, body)
+		}
 	}
+	WaitForAllTcketsDone()
 
-	parts := make([]obs.Part, 0, partCount)
-
-	numFailedParts := 0
-	for {
-		part, ok := <-partChan
-		if !ok {
-			break
-		}
-		if part.PartNumber == -1 {
-			numFailedParts++
-		}
-		parts = append(parts, part)
-		if len(parts) == partCount {
-			close(partChan)
-		}
-	}
-
-	if numFailedParts > 0 {
-		return fmt.Errorf("%d parts failed to upload", numFailedParts)
+	if hasFailures {
+		return fmt.Errorf("failed to upload parts, try reducing rclone --transfers or advanced tx concurrency settings")
 	}
 
 	completeMultipartUploadInput := &obs.CompleteMultipartUploadInput{}
@@ -1349,10 +1350,6 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 }
 
 func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if src.Size() == 0 {
-		return fs.ErrorCantUploadEmptyFiles
-	}
-
 	tmpObject, err := o.fs.NewObject(ctx, o.Remote())
 
 	if err == nil {
@@ -1391,16 +1388,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 	switch fileUploadSessionRes.Status {
 	case 1:
 		file := io.MultiReader(bytes.NewReader(first10mBytes), in)
-
-		// calculate part size according to the target multipart concurrency
-		partSize := src.Size() / int64(o.fs.opt.MultipartTxConcurrency)
-		if partSize < minPartSize {
-			partSize = minPartSize
-		} else if partSize > maxPartSize {
-			partSize = maxPartSize
-		}
-
-		err = o.UploadParts(&file, &fileUploadSessionRes, src.Size(), partSize)
+		err = o.UploadParts(&file, &fileUploadSessionRes, src.Size(), o.fs.opt.MultipartTxPartSize)
 		if err != nil {
 			return err
 		}
@@ -1486,7 +1474,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	if o.fs.opt.MultipartTxConcurrency > 0 {
+	if o.fs.opt.MultipartTxConcurrency > 0 && src.Size() >= minPartSize {
 		return o._MultipartUpload(ctx, in, src, options...)
 	}
 
