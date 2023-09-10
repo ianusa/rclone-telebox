@@ -48,6 +48,9 @@ const (
 	multipartRxConcurrency             = 16
 	minDownloadPartSize                = 1 * 1_024 * 1_024
 	maxTxRxRetries                     = 3
+	minTxRxRetrySleep                  = 20 * time.Millisecond
+	maxTxRxRetrySleep                  = 500 * time.Millisecond
+	multipartTxIntegrity               = false
 )
 
 func init() {
@@ -88,6 +91,11 @@ func init() {
 			Default:    multipartMaxBufferSize,
 			Advanced:   true,
 		}, {
+			Name:       "multipart_tx_integrity",
+			Help:       "Whether to check multipart upload integrity, may impact throughput to some extent",
+			Default:    multipartTxIntegrity,
+			Advanced:   true,
+		}, {
 			Name:       "multipart_rx_concurrency",
 			Help:       "The target concurrency of multipart donwloading. 0 to disable",
 			Default:    multipartRxConcurrency,
@@ -111,6 +119,7 @@ type Options struct {
 	MultipartTxConcurrency int         `config:"multipart_tx_concurrency"`
 	MultipartTxPartSize   int64        `config:"multipart_tx_part_size"`
 	MultipartTxMaxBufferSize int64     `config:"multipart_tx_max_buffer_size"`
+	MultipartTxIntegrity   bool        `config:"multipart_tx_integrity"`
 	MultipartRxConcurrency int         `config:"multipart_rx_concurrency"`
 	MultipartResponseHeaderTimeout int `config:"multipart_response_header_timeout"`
 }
@@ -174,15 +183,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	for i := 0; i < f.opt.MultipartTxConcurrency; i++ {
 		f.txPacers = append(f.txPacers, fs.NewPacer(
-			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
-			pacer.MaxSleep(maxSleep),
+			ctx, pacer.NewDefault(pacer.MinSleep(minTxRxRetrySleep),
+			pacer.MaxSleep(maxTxRxRetrySleep),
 			pacer.DecayConstant(decayConstant))))
 	}
 
 	for i := 0; i < f.opt.MultipartRxConcurrency; i++ {
 		f.rxPacers = append(f.rxPacers, fs.NewPacer(
-			ctx, pacer.NewDefault(pacer.MinSleep(minSleep),
-			pacer.MaxSleep(maxSleep),
+			ctx, pacer.NewDefault(pacer.MinSleep(minTxRxRetrySleep),
+			pacer.MaxSleep(maxTxRxRetrySleep),
 			pacer.DecayConstant(decayConstant))))
 	}
 
@@ -1296,20 +1305,22 @@ func (o *Object) UploadParts(in *io.Reader, metadata *api.FileUploadSessionRes, 
 			go func(partNumber int, body *bytes.Reader) {
 				defer ReleaseTicket()
 
-				h := md5.New()
-				_, err := io.Copy(h, body)
-				if err != nil {
-					hasFailures = true
-					log.Default().Printf("failed to hash part %d: %v", partNumber, err)
-					return
-				}
-
 				uploadPartInput := &obs.UploadPartInput{}
 				uploadPartInput.Bucket = metadata.Data.Bucket
 				uploadPartInput.Key = metadata.Data.PoolPath
 				uploadPartInput.UploadId = initiateMultipartUploadOutput.UploadId
-				uploadPartInput.ContentMD5 = obs.Base64Encode(h.Sum(nil))
 				uploadPartInput.PartNumber = partNumber
+
+				if o.fs.opt.MultipartTxIntegrity {
+					h := md5.New()
+					_, err := io.Copy(h, body)
+					if err != nil {
+						hasFailures = true
+						log.Default().Printf("failed to hash part %d: %v", partNumber, err)
+						return
+					}
+					uploadPartInput.ContentMD5 = obs.Base64Encode(h.Sum(nil))
+				}
 
 				var uploadPartInputOutput *obs.UploadPartOutput
 				pacer := o.fs.txPacers[partNumber % len(o.fs.txPacers)]
@@ -1450,8 +1461,7 @@ func (o *Object) _MultipartUpload(ctx context.Context, in io.Reader, src fs.Obje
 			o.modTime = time.Now()
 			return nil
 		}
-		log.Default().Printf(
-			"Failed both getObjectWithRetries(%s) and direct object update", name)
+		return fmt.Errorf("failed both getObjectWithRetries(%s) and direct object update, err: %w", name, err)
 	}
 
 	o.pid = pid
