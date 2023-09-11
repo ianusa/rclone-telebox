@@ -51,6 +51,7 @@ const (
 	minTxRxRetrySleep                  = 20 * time.Millisecond
 	maxTxRxRetrySleep                  = 500 * time.Millisecond
 	multipartTxIntegrity               = false
+	multipartTxPacerNumberScale        = 3
 )
 
 func init() {
@@ -181,7 +182,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		accToken: "",
 	}
 
-	for i := 0; i < f.opt.MultipartTxConcurrency; i++ {
+	for i := 0; i < f.opt.MultipartTxConcurrency * multipartTxPacerNumberScale; i++ {
 		f.txPacers = append(f.txPacers, fs.NewPacer(
 			ctx, pacer.NewDefault(pacer.MinSleep(minTxRxRetrySleep),
 			pacer.MaxSleep(maxTxRxRetrySleep),
