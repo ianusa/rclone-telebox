@@ -43,8 +43,8 @@ const (
 	minPartSize                        = 100 * 1_024 // SDK developer guide: min 100 KB
 	defaultPartSize                    = 6 * 1_024 * 1_024
 	maxPerUploadParts                  = 10_000
-	multipartMaxBufferSize             = 100 * 1024 * 1024
-	multipartTxConcurrency             = 16
+	multipartMaxBufferSize             = 200 * 1024 * 1024
+	multipartTxConcurrency             = 32
 	multipartRxConcurrency             = 16
 	minDownloadPartSize                = 1 * 1_024 * 1_024
 	maxTxRxRetries                     = 3
