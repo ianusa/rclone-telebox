@@ -52,7 +52,7 @@ const (
 	multipartResponseHeaderTimeoutSec  = 90
 	maxPartSize                        = 5 * 1_024 * 1_024 * 1_024 // SDK developer guide: max 5 GB
 	minPartSize                        = 1 // SDK developer guide: min 100 KB?
-	defaultPartSize                    = 6 * 1_024 * 1_024
+	defaultPartSize                    = 5 * 1_024 * 1_024
 	maxPerUploadParts                  = 10_000
 	multipartMaxBufferSize             = 200 * 1024 * 1024
 	multipartTxConcurrency             = 32
@@ -65,6 +65,7 @@ const (
 	multipartTxPacerNumberScale        = 3
 	rootID                             = "0"
 	userAgent                          = "okhttp/4.9.3"
+	maxSearchNameLength                = 50
 )
 
 func init() {
@@ -468,7 +469,7 @@ func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (
 
 	query := name
 	query = strings.TrimSpace(query) // search doesn't like spaces
-	if !searchOK.MatchString(query) {
+	if len(query) > maxSearchNameLength || !searchOK.MatchString(query) {
 		// If query isn't good then do an unbounded search
 		query = ""
 	}
@@ -647,7 +648,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, name string, fn listAllF
 		numberOfEntities = maxEntitiesPerPage
 	)
 	name = strings.TrimSpace(name) // search doesn't like spaces
-	if !searchOK.MatchString(name) {
+	if len(name) > maxSearchNameLength || !searchOK.MatchString(name) {
 		// If name isn't good then do an unbounded search
 		name = ""
 	}
