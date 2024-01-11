@@ -45,7 +45,7 @@ import (
 )
 
 const (
-	maxEntitiesPerPage                 = 1024
+	maxEntitiesPerPage                 = 1000
 	minSleep                           = 200 * time.Millisecond // Server sometimes reflects changes slowly
 	maxSleep                           = 2 * time.Second
 	decayConstant                      = 2
@@ -632,7 +632,7 @@ type listAllFn func(*api.Entity) bool
 // Search is a bit fussy about which characters match
 //
 // If the name doesn't match this then do an dir list instead
-var searchOK = regexp.MustCompile(`^[a-zA-Z0-9_ .]+$`)
+var searchOK = regexp.MustCompile(`^[a-zA-Z0-9_ -.]{1,50}$`)
 
 // Lists the directory required calling the user function on each item found
 //
