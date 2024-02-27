@@ -237,6 +237,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
+		CaseInsensitive:         true,
 		ReadMimeType:            true,
 	}).Fill(ctx, f)
 
@@ -488,7 +489,7 @@ func getObject(f *Fs, ctx context.Context, name string, pid int, token string) (
 		numberOfEntities = len(searchResponse.SearchData.Entities)
 
 		for _, entity := range searchResponse.SearchData.Entities {
-			if entity.Pid == pid && f.opt.Enc.ToStandardName(entity.Name) == name {
+			if entity.Pid == pid && strings.EqualFold(f.opt.Enc.ToStandardName(entity.Name), name) {
 				newObject = entity
 				newObjectIsFound = true
 				break
@@ -687,7 +688,7 @@ OUTER:
 func (f *Fs) FindLeaf(ctx context.Context, directoryID, leaf string) (directoryIDOut string, found bool, err error) {
 	// Find the leaf in directoryID
 	found, err = f.listAll(ctx, directoryID, leaf, func(entity *api.Entity) bool {
-		if IsDir(entity) && f.opt.Enc.ToStandardName(entity.Name) == leaf {
+		if IsDir(entity) && strings.EqualFold(f.opt.Enc.ToStandardName(entity.Name), leaf) {
 			directoryIDOut = itoa(entity.ID)
 			return true
 		}
