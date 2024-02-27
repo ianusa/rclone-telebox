@@ -1,7 +1,6 @@
 Rclone-telebox is an enhanced version of [rclone](https://github.com/rclone/rclone) extending and enhancing capabilitis of Telebox (was Linkbox) backend.
 
 ## The Feature Highlight ##
-* Case sensitive
 * No need of skipping tests with proper encoder(s)
 * Support Aborter which provides the possibility to union multiple cloud disks
 * Support DirMover which moves/renames directories on the server
