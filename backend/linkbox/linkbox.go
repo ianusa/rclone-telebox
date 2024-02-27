@@ -237,6 +237,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
+		CaseInsensitive:         true,
 		ReadMimeType:            true,
 	}).Fill(ctx, f)
 
